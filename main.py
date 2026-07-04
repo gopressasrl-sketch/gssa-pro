@@ -1,138 +1,131 @@
 import streamlit as st
-import os, cv2, json, re
+from streamlit_gsheets import GSheetsConnection
+import os, cv2, re, pandas as pd
 from datetime import datetime
 import google.generativeai as genai
-from PIL import Image
-from dotenv import load_dotenv
 from fpdf import FPDF
 
 # --- CONFIGURAZIONE CHIAVE API ---
 if "GEMINI_API_KEY" in st.secrets:
     GEMINI_KEY = st.secrets["GEMINI_API_KEY"]
 else:
-    load_dotenv()
     GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 genai.configure(api_key=GEMINI_KEY)
-DB_FILE = "archivio_flotta.json"
 
-@st.cache_resource
-def ottieni_miglior_modello():
-    try:
-        modelli_validi = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods and "gemini" in m.name]
-        modelli_validi.sort(key=lambda x: [int(s) if s.isdigit() else s for s in re.split(r'(\d+)', x)], reverse=True)
-        return modelli_validi[0]
-    except: return "models/gemini-1.5-flash"
-
-MODELLO_ATTIVO = ottieni_miglior_modello()
-
+# --- LISTA TARGHE UFFICIALE ---
 TARGHE_GSSA = ["HB183CY", "HB284CY", "HB339CY", "HB184CY", "GG730AV", "GG243ZM", "GG677RR", "GG927ZP", "GG429ZP", "GG790ZL", "GG075ZP", "GG206JK", "GG834JH", "GG736AV", "GG477JF", "GZ399JY", "GZ401JY", "HA717DG", "GS597DF", "GZ532JY", "HA412FV", "HA630DC", "HA881MM", "GZ249ZS", "GZ023SB", "HA668DG", "HA942FV", "HA953FV", "HA957FV", "HA539SS", "GG392AW", "GG733AV", "GG303AW", "GG161HW", "GG850JH", "GG828JH", "GG831AV", "GG318AW", "GG484JF", "GG408AW", "GG341AW", "GG207JK", "GG558JH", "GG564JH", "GG181HW", "GG473JF", "GG208JK", "GG829JH", "GG192ZN", "GG163HW", "GJ873LS"]
 
-def carica_db():
-    if not os.path.exists(DB_FILE):
-        db = {t: {"stato": "DA CONTROLLARE", "data": "-", "report": ""} for t in TARGHE_GSSA}
-        with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
-    with open(DB_FILE, "r") as f: return json.load(f)
+# --- CONNESSIONE GOOGLE SHEETS ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-def salva_db(dati):
-    with open(DB_FILE, "w") as f: json.dump(dati, f, indent=4)
+def carica_dati_gsheets():
+    try:
+        return conn.read(worksheet="ispezioni", ttl="0s")
+    except:
+        # Se il foglio è vuoto, creiamo la struttura iniziale
+        df_iniziale = pd.DataFrame([{"Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for t in TARGHE_GSSA])
+        conn.update(worksheet="ispezioni", data=df_iniziale)
+        return df_iniziale
 
+# --- FUNZIONI VIDEO E PDF ---
 def estrai_frame(video_path):
     frames = []
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    num_frames = 50 
-    step = max(1, total // num_frames)
-    for i in range(num_frames):
+    step = max(1, total // 50)
+    for i in range(50):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
         ret, frame = cap.read()
         if not ret: break
-        # Risoluzione bilanciata per Mobile
         frame_res = cv2.resize(frame, (800, 600))
         _, buffer = cv2.imencode('.jpg', frame_res, [cv2.IMWRITE_JPEG_QUALITY, 70])
         frames.append({"image": cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB), "bytes": buffer.tobytes()})
     cap.release()
     return frames
 
-def crea_pdf_report(targa, report_testo, esito_nuovo):
+def crea_pdf_bytes(targa, report_testo, esito_nuovo):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, f"REPORT PERIZIA VEICOLO: {targa}", ln=True, align="C")
+    pdf.cell(0, 10, f"REPORT PERIZIA GSSA: {targa}", ln=True, align="C")
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 10, f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
     pdf.ln(10)
     pdf.set_font("Helvetica", "B", 12)
-    if esito_nuovo:
-        pdf.set_fill_color(255, 230, 230)
-        testo_box = "ESITO: RILEVATI DANNI / VARIAZIONI"
-    else:
-        pdf.set_fill_color(230, 255, 230)
-        testo_box = "ESITO: NESSUNA NUOVA ANOMALIA"
-    pdf.cell(0, 10, testo_box, ln=True, align="C", fill=True)
+    colore = (255, 230, 230) if esito_nuovo else (230, 255, 230)
+    pdf.set_fill_color(*colore)
+    pdf.cell(0, 10, "RILEVATI NUOVI DANNI" if esito_nuovo else "NESSUNA NUOVA ANOMALIA", ln=True, align="C", fill=True)
     pdf.ln(5)
     pdf.set_font("Helvetica", "", 11)
-    testo_pulito = report_testo.replace("**", "").replace("#", "").encode('latin-1', 'replace').decode('latin-1')
-    pdf.multi_cell(0, 7, testo_pulito)
-    return pdf.output(dest='S')
+    testo_p = report_testo.replace("**", "").encode('latin-1', 'replace').decode('latin-1')
+    pdf.multi_cell(0, 7, testo_p)
+    return pdf.output(dest='S').encode('latin-1')
 
 # --- INTERFACCIA ---
-st.set_page_config(page_title="GSSA PRO", layout="wide")
-db = carica_db()
+st.set_page_config(page_title="GSSA PRO CLOUD", layout="wide")
+df = carica_dati_gsheets()
 
-st.title("🚚 GSSA PRO - Gestione Ispezioni")
-targa_selezionata = st.sidebar.selectbox("Seleziona Targa:", TARGHE_GSSA)
-info = db[targa_selezionata]
+menu = st.sidebar.radio("Navigazione", ["🔍 Ispezione", "📂 Archivio", "👑 Area Admin"])
 
-tab1, tab2 = st.tabs(["🔍 NUOVA ANALISI", "📂 ARCHIVIO"])
-
-with tab1:
-    video_file = st.file_uploader("Carica Video", type=["mp4", "mov", "avi"])
-    if st.button("🚀 AVVIA PERIZIA"):
-        if video_file:
-            with st.spinner("Analisi in corso..."):
-                with open("temp_v.mp4", "wb") as f: f.write(video_file.read())
-                frames_estratti = estrai_frame("temp_v.mp4")
-                storico = info.get("report", "")
-                is_prima = storico == "" or "NESSUN DANNO" in storico.upper()
-
-                model = genai.GenerativeModel(MODELLO_ATTIVO)
-                if is_prima:
-                    prompt = f"PRIMA REGISTRAZIONE VEICOLO {targa_selezionata}. Elenca ogni danno zonale nei 50 frame. Sii pignolo."
+# --- 1. ISPEZIONE ---
+if menu == "🔍 Ispezione":
+    st.title("🔍 Nuova Perizia")
+    targa = st.selectbox("Seleziona Veicolo:", TARGHE_GSSA)
+    video = st.file_uploader("Carica Video", type=["mp4", "mov"])
+    
+    if st.button("🚀 AVVIA ANALISI"):
+        if video:
+            with st.spinner("Analisi e sincronizzazione con Google Sheets..."):
+                with open("temp.mp4", "wb") as f: f.write(video.read())
+                frames = estrai_frame("temp.mp4")
+                
+                # Cerca lo storico nel foglio
+                row = df[df["Targa"] == targa].iloc[0]
+                storico = str(row["Report"]) if pd.notna(row["Report"]) else ""
+                
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                if storico == "" or "NESSUN DANNO" in storico.upper():
+                    prompt = f"Prima perizia per {targa}. Elenca ogni danno zonale."
                 else:
-                    prompt = f"CONFRONTO VEICOLO {targa_selezionata}.\nSTORICO: {storico}\nSe non ci sono nuovi danni rispondi esattamente 'NESSUN NUOVO DANNO'."
+                    prompt = f"Confronto per {targa}. Storico: {storico}. Se non ci sono nuovi danni rispondi esattamente 'NESSUN NUOVO DANNO'."
 
-                contenuto = [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames_estratti]
-                try:
-                    response = model.generate_content([prompt] + contenuto)
-                    ris_ai = response.text.strip()
-                    nuovi = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                    
-                    testo_final = ris_ai if nuovi or is_prima else "✅ Ispezione apposto, nessun nuovo danno rilevato."
-                    if nuovi or is_prima: db[targa_selezionata]["report"] = ris_ai
-                    db[targa_selezionata]["data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                    db[targa_selezionata]["stato"] = "🚨 DANNI" if nuovi or is_prima else "✅ OK"
-                    salva_db(db)
-                    
-                    st.markdown(testo_final)
-                    pdf_data = crea_pdf_report(targa_selezionata, testo_final, nuovi or is_prima)
-                    st.download_button("📥 SCARICA PDF", data=bytes(pdf_data) if isinstance(pdf_data, (bytes, bytearray)) else pdf_data.encode('latin-1'), file_name=f"Report_{targa_selezionata}.pdf")
-                    
-                    # --- GALLERIA FOTOGRAMMI OTTIMIZZATA PER MOBILE ---
-                    st.divider()
-                    st.subheader("📸 Fotogrammi Analizzati (Selezione)")
-                    # Usiamo 2 colonne invece di 4 per farle vedere meglio su mobile
-                    cols = st.columns(2)
-                    for idx, f in enumerate(frames_estratti[:20]): # Mostriamo solo i primi 20 per velocità
-                        with cols[idx % 2]:
-                            st.image(f['image'], use_container_width=True, caption=f"Foto {idx+1}")
-                            
-                except Exception as e: st.error(f"Errore: {e}")
-        else: st.warning("Manca il video.")
+                response = model.generate_content([prompt] + [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames])
+                ris = response.text.strip()
+                
+                nuovi = "NESSUN NUOVO DANNO" not in ris.upper()
+                testo_f = ris if nuovi or storico == "" else "✅ Ispezione apposto, nessun nuovo danno rilevato."
+                
+                # AGGIORNA IL DATAFRAME E CARICA SU GSHEETS
+                df.loc[df["Targa"] == targa, "Report"] = ris if nuovi or storico == "" else storico
+                df.loc[df["Targa"] == targa, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                df.loc[df["Targa"] == targa, "Stato"] = "🚨 DANNI" if nuovi or storico == "" else "✅ OK"
+                
+                conn.update(worksheet="ispezioni", data=df)
+                st.success("Dati salvati permanentemente su Google Sheets!")
+                
+                st.markdown(f"### Risultato {targa}:")
+                st.write(testo_f)
+                
+                pdf = crea_pdf_bytes(targa, testo_f, nuovi)
+                st.download_button("📥 Scarica PDF Ufficiale", data=pdf, file_name=f"Report_{targa}.pdf")
 
-with tab2:
-    if info["report"]:
-        st.write(f"Data: {info['data']}")
-        st.markdown(info["report"])
+# --- 2. ARCHIVIO ---
+elif menu == "📂 Archivio":
+    st.title("📂 Archivio Storico")
+    targa = st.selectbox("Cerca Targa:", TARGHE_GSSA)
+    res = df[df["Targa"] == targa].iloc[0]
+    st.write(f"**Stato:** {res['Stato']}")
+    st.write(f"**Ultimo Controllo:** {res['Data']}")
+    st.info(res['Report'] if res['Report'] else "Nessuna perizia registrata.")
 
-if os.path.exists("temp_v.mp4"): os.remove("temp_v.mp4")
+# --- 3. AREA ADMIN ---
+elif menu == "👑 Area Admin":
+    st.title("👑 Pannello Amministratore")
+    pw = st.text_input("Password Admin", type="password")
+    if pw == "GSSA2026":
+        st.subheader("Stato Flotta in tempo reale (da Google Sheets)")
+        st.dataframe(df, use_container_width=True)
+        st.download_button("📊 Scarica Excel", data=df.to_csv(index=False).encode('utf-8'), file_name="flotta_gssa.csv")
+    elif pw:
+        st.error("Accesso negato")
