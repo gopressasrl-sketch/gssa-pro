@@ -11,7 +11,6 @@ if "GEMINI_API_KEY" in st.secrets:
 else:
     GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# Configurazione con trasporto standard per evitare l'errore Response [200]
 genai.configure(api_key=GEMINI_KEY)
 
 @st.cache_resource
@@ -40,13 +39,13 @@ def estrai_frame(video_path):
     frames = []
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total // 50)
-    for i in range(50):
+    step = max(1, total // 40) # 40 frame per non appesantire troppo la memoria
+    for i in range(40):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
         ret, frame = cap.read()
         if not ret: break
-        frame_res = cv2.resize(frame, (1024, 768))
-        _, buffer = cv2.imencode('.jpg', frame_res, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        frame_res = cv2.resize(frame, (800, 600))
+        _, buffer = cv2.imencode('.jpg', frame_res, [cv2.IMWRITE_JPEG_QUALITY, 75])
         frames.append({"image": cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB), "bytes": buffer.tobytes()})
     cap.release()
     return frames
@@ -58,10 +57,11 @@ def crea_pdf_report(targa, report_testo, esito_nuovo):
     pdf.cell(0, 10, f"REPORT PERIZIA GSSA: {targa}", ln=True, align="C")
     pdf.ln(10)
     pdf.set_font("Helvetica", "B", 12)
-    pdf.set_fill_color(255, 230, 230) if esito_nuovo else pdf.set_fill_color(230, 255, 230)
+    if esito_nuovo: pdf.set_fill_color(255, 230, 230)
+    else: pdf.set_fill_color(230, 255, 230)
     pdf.cell(0, 10, "DANNI RILEVATI" if esito_nuovo else "NESSUNA NUOVA ANOMALIA", ln=True, align="C", fill=True)
     pdf.ln(5)
-    pdf.set_font("Helvetica", "", 11)
+    pdf.set_font("Helvetica", "", 10)
     testo_p = report_testo.replace("**", "").encode('latin-1', 'replace').decode('latin-1')
     pdf.multi_cell(0, 7, testo_p)
     return pdf.output(dest='S')
@@ -73,7 +73,7 @@ df = carica_dati()
 menu = st.sidebar.radio("Navigazione", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
-    st.title("🔍 Nuova Perizia")
+    st.title("🔍 Nuova Perizia Professionale")
     targa = st.selectbox("Seleziona Targa:", TARGHE_GSSA)
     video = st.file_uploader("Carica Video", type=["mp4", "mov", "avi"])
     
@@ -83,56 +83,63 @@ if menu == "🔍 Ispezione":
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 frames = estrai_frame("temp.mp4")
                 
-                # Recupero storico
+                # Cerca storico
                 row = df[df["Targa"] == targa].iloc[0]
                 storico = str(row["Report"]) if pd.notna(row["Report"]) and row["Report"] != "" else "Nessuno"
                 
                 model = genai.GenerativeModel(MODELLO_ATTIVO)
-                prompt = (f"Analisi per {targa}. Storico: {storico}. "
-                          "Elenca nuovi danni o scrivi 'NESSUN NUOVO DANNO'.")
+                prompt = (f"Analisi per furgone {targa}. Storico: {storico}. "
+                          "Confronta i fotogrammi con lo storico. "
+                          "Se non vedi nuovi danni rispondi ESATTAMENTE: 'NESSUN NUOVO DANNO'. "
+                          "Altrimenti elenca i nuovi danni per zona. Sii preciso.")
                 
-                contenuto = [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames]
+                immagini = [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames]
                 
                 try:
-                    # Chiamata all'IA con gestione filtri di sicurezza
-                    response = model.generate_content([prompt] + contenuto, 
-                                                      safety_settings=[
-                                                          {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                                                          {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                                                          {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                                                          {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-                                                      ])
+                    # Chiamata con sicurezza per evitare il blocco Response [200]
+                    response = model.generate_content([prompt] + immagini)
                     
-                    # CORREZIONE ERRORE RESPONSE [200]:
-                    if response.candidates:
-                        ris_ai = response.candidates[0].content.parts[0].text.strip()
-                    else:
-                        ris_ai = "Errore: L'IA ha bloccato la risposta per motivi di sicurezza o il video non è chiaro."
+                    # LOGICA ESTRAZIONE TESTO ROBUSTA
+                    try:
+                        ris_ai = response.text.strip()
+                    except:
+                        if response.candidates:
+                            ris_ai = response.candidates[0].content.parts[0].text.strip()
+                        else:
+                            ris_ai = "Errore: Risposta bloccata o non generata dall'IA."
 
                     nuovi = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                    testo_final = ris_ai if nuovi or storico == "Nessuno" else "✅ Ispezione apposto, nessun nuovo danno rilevato."
+                    testo_final = ris_ai if nuovi or storico == "Nessuno" else "✅ Ispezione apposto, nessun nuovo danno rilevato rispetto al passato."
                     
-                    # Aggiorna e Salva su Google Sheets
+                    # Aggiorna Database
                     if nuovi or storico == "Nessuno":
                         df.loc[df["Targa"] == targa, "Report"] = ris_ai
                     df.loc[df["Targa"] == targa, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
                     df.loc[df["Targa"] == targa, "Stato"] = "🚨 DANNI" if nuovi or storico == "Nessuno" else "✅ OK"
                     
+                    # Carica su Google Sheets
                     conn.update(worksheet="ispezioni", data=df)
-                    st.success("Analisi completata e salvata!")
+                    st.success("Analisi completata e salvata nel database!")
                     st.markdown(testo_final)
                     
+                    # Generazione PDF
                     pdf_data = crea_pdf_report(targa, testo_final, nuovi or storico == "Nessuno")
-                    st.download_button("📥 Scarica PDF", data=bytes(pdf_data), file_name=f"{targa}.pdf")
+                    st.download_button("📥 Scarica PDF Ufficiale", data=bytes(pdf_data), file_name=f"{targa}.pdf")
                     
+                    # Galleria Mobile
+                    st.divider()
+                    cols = st.columns(2)
+                    for i, f in enumerate(frames[:10]): # Mostra i primi 10 per controllo veloce
+                        with cols[i%2]: st.image(f['image'], use_container_width=True)
+
                 except Exception as e:
-                    st.error(f"Errore tecnico: {str(e)}")
+                    st.error(f"Errore tecnico durante la perizia: {str(e)}")
         else: st.warning("Manca il video.")
 
 elif menu == "👑 Admin":
-    st.title("Area Admin")
+    st.title("Area Amministratore")
     pw = st.text_input("Password", type="password")
     if pw == "GSSA2026":
-        st.dataframe(df)
+        st.dataframe(df, use_container_width=True)
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
