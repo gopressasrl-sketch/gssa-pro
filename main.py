@@ -136,4 +136,22 @@ if menu == "🔍 Ispezione":
                     
                     # Tasto PDF
                     pdf_data = crea_pdf_report(targa, testo_final, nuovi or storico == "Nessuno")
-                    st.download_button("📥 SCARICA PDF", data=bytes(pdf_data) if isinstance(pdf_data, (bytes, by
+                    st.download_button("📥 SCARICA PDF", data=bytes(pdf_data) if isinstance(pdf_data, (bytes, bytearray)) else pdf_data.encode('latin-1'), file_name=f"Report_{targa}.pdf")
+                    
+                    # Galleria Mobile
+                    st.divider()
+                    cols = st.columns(2)
+                    for i, f in enumerate(frames_estratti[:10]):
+                        with cols[i%2]: st.image(f['image'], use_container_width=True, caption=f"Foto {i+1}")
+
+                except Exception as e: st.error(f"Errore AI: {e}")
+        else: st.warning("Carica un video.")
+
+elif menu == "👑 Area Admin":
+    st.title("👑 Pannello Admin Flotta")
+    pw = st.text_input("Password", type="password")
+    if pw == "GSSA2026":
+        st.dataframe(df, use_container_width=True)
+    elif pw: st.error("Password Errata")
+
+if os.path.exists("temp_v.mp4"): os.remove("temp_v.mp4")
