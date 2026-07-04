@@ -6,7 +6,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from fpdf import FPDF
 
-# --- CONFIGURAZIONE CHIAVE API (CLOUD + LOCALE) ---
+# --- CONFIGURAZIONE CHIAVE API ---
 if "GEMINI_API_KEY" in st.secrets:
     GEMINI_KEY = st.secrets["GEMINI_API_KEY"]
 else:
@@ -47,8 +47,9 @@ def estrai_frame(video_path):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
         ret, frame = cap.read()
         if not ret: break
-        frame_res = cv2.resize(frame, (1024, 768))
-        _, buffer = cv2.imencode('.jpg', frame_res, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Risoluzione bilanciata per Mobile
+        frame_res = cv2.resize(frame, (800, 600))
+        _, buffer = cv2.imencode('.jpg', frame_res, [cv2.IMWRITE_JPEG_QUALITY, 70])
         frames.append({"image": cv2.cvtColor(frame_res, cv2.COLOR_BGR2RGB), "bytes": buffer.tobytes()})
     cap.release()
     return frames
@@ -91,17 +92,17 @@ with tab1:
         if video_file:
             with st.spinner("Analisi in corso..."):
                 with open("temp_v.mp4", "wb") as f: f.write(video_file.read())
-                frames = estrai_frame("temp_v.mp4")
+                frames_estratti = estrai_frame("temp_v.mp4")
                 storico = info.get("report", "")
                 is_prima = storico == "" or "NESSUN DANNO" in storico.upper()
 
                 model = genai.GenerativeModel(MODELLO_ATTIVO)
                 if is_prima:
-                    prompt = f"PRIMA REGISTRAZIONE VEICOLO {targa_selezionata}. Elenca ogni danno visibile zonale nei 50 frame."
+                    prompt = f"PRIMA REGISTRAZIONE VEICOLO {targa_selezionata}. Elenca ogni danno zonale nei 50 frame. Sii pignolo."
                 else:
                     prompt = f"CONFRONTO VEICOLO {targa_selezionata}.\nSTORICO: {storico}\nSe non ci sono nuovi danni rispondi esattamente 'NESSUN NUOVO DANNO'."
 
-                contenuto = [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames]
+                contenuto = [{"mime_type": "image/jpeg", "data": f['bytes']} for f in frames_estratti]
                 try:
                     response = model.generate_content([prompt] + contenuto)
                     ris_ai = response.text.strip()
@@ -116,6 +117,16 @@ with tab1:
                     st.markdown(testo_final)
                     pdf_data = crea_pdf_report(targa_selezionata, testo_final, nuovi or is_prima)
                     st.download_button("📥 SCARICA PDF", data=bytes(pdf_data) if isinstance(pdf_data, (bytes, bytearray)) else pdf_data.encode('latin-1'), file_name=f"Report_{targa_selezionata}.pdf")
+                    
+                    # --- GALLERIA FOTOGRAMMI OTTIMIZZATA PER MOBILE ---
+                    st.divider()
+                    st.subheader("📸 Fotogrammi Analizzati (Selezione)")
+                    # Usiamo 2 colonne invece di 4 per farle vedere meglio su mobile
+                    cols = st.columns(2)
+                    for idx, f in enumerate(frames_estratti[:20]): # Mostriamo solo i primi 20 per velocità
+                        with cols[idx % 2]:
+                            st.image(f['image'], use_container_width=True, caption=f"Foto {idx+1}")
+                            
                 except Exception as e: st.error(f"Errore: {e}")
         else: st.warning("Manca il video.")
 
