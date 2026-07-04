@@ -1,6 +1,7 @@
 streamlit
+st-gsheets-connection
 opencv-python-headless
 google-generativeai
 fpdf
-python-dotenv
+pandas
 Pillow
