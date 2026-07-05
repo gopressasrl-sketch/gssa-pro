@@ -54,50 +54,59 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 def carica_dati():
     try:
         df_read = conn.read(worksheet="ispezioni", ttl="0s")
-        return df_read.astype(str).replace(['None', 'nan', 'NaN'], '')
+        # Pulisce i valori nulli o nan immediatamente
+        return df_read.fillna("").astype(str).replace(['None', 'nan', 'NaN'], '')
     except:
         data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
         return pd.DataFrame(data).astype(str)
 
 def salva_dati(df_to_save):
-    df_to_save = df_to_save.astype(str).replace(['None', 'nan', 'NaN'], '')
+    df_to_save = df_to_save.fillna("").astype(str).replace(['None', 'nan', 'NaN'], '')
     conn.update(worksheet="ispezioni", data=df_to_save)
     return True
 
 # --- FUNZIONI PDF E AI ---
-def pulisci_testo_pdf(testo):
-    """Rimuove EMOJI e caratteri non supportati per evitare il crash latin-1"""
-    if not testo: return ""
-    # Sostituzioni manuali per Citroën e simboli comuni
-    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-")
-    # Rimuove EMOJI e caratteri non-latin1 (come la sirena 🚨)
-    testo_pulito = "".join(c for c in testo if ord(c) < 256)
-    # Normalizzazione finale
-    return testo_pulito.replace("**", "").replace("#", "").strip()
+def pulisci_per_pdf(testo):
+    """Rimuove accenti, emoji e simboli per evitare crash del PDF"""
+    if not testo or testo == "nan": return "Nessun dettaglio."
+    
+    # Sostituzioni base per lettere italiane e simboli comuni
+    sostituzioni = {
+        "à": "a", "è": "e", "é": "e", "ì": "i", "ò": "o", "ù": "u",
+        "À": "A", "È": "E", "Ì": "I", "Ò": "O", "Ù": "U", "ë": "e", "Ë": "E",
+        "•": "-", "·": "-", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-"
+    }
+    for originale, cambio in sostituzioni.items():
+        testo = testo.replace(originale, cambio)
+    
+    # Rimuove caratteri non-ASCII (Emoji ecc.)
+    testo_ascii = testo.encode('ascii', 'ignore').decode('ascii')
+    
+    # Rimuove formattazione Markdown dell'IA
+    return testo_ascii.replace("**", "").replace("#", "").strip()
 
 def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, f"REPORT PERIZIA VEICOLO: {targa}", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 8, f"Telaio (VIN): {vin}", ln=True, align="C")
-    pdf.cell(0, 8, f"Data Ispezione: {data_report}", ln=True, align="C")
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 8, f"VIN: {vin} | Data: {data_report}", ln=True, align="C")
     pdf.ln(10)
     
-    if "OK" in stato: pdf.set_fill_color(200, 255, 200)
+    # Colore stato
+    if "OK" in stato.upper(): pdf.set_fill_color(200, 255, 200)
     else: pdf.set_fill_color(255, 200, 200)
     
-    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, f"STATO: {stato}", ln=True, align="C", fill=True)
     pdf.ln(5)
     
-    pdf.set_font("Helvetica", "", 10)
-    testo_sicuro = pulisci_testo_pdf(testo)
-    pdf.multi_cell(0, 7, testo_sicuro)
+    pdf.set_font("Arial", "", 11)
+    testo_pulito = pulisci_per_pdf(testo)
+    pdf.multi_cell(0, 7, testo_pulito)
     
-    out = pdf.output(dest='S')
-    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode('latin-1')
+    return pdf.output(dest='S').encode('latin-1', 'ignore')
 
 def chiama_gemini(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
@@ -106,7 +115,7 @@ def chiama_gemini(prompt, frames_b64):
     res = requests.post(url, json=payload, timeout=120)
     if res.status_code == 200:
         return res.json()['candidates'][0]['content']['parts'][0]['text']
-    return "Errore AI"
+    return f"Errore AI: {res.status_code}"
 
 def estrai_frame(video_path):
     frames = []
@@ -129,10 +138,10 @@ if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_V
 if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = False
 
 st.sidebar.title("Furgoni GSSA")
-menu = st.sidebar.radio("Naviga:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
+menu = st.sidebar.radio("Vai a:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
-    st.title("Nuova Ispezione")
+    st.title("Ispezione Mezzi")
     if not st.session_state.mostra_camera:
         if st.button("📷 SCANSIONA VIN", use_container_width=True):
             st.session_state.mostra_camera = True
@@ -148,9 +157,9 @@ if menu == "🔍 Ispezione":
                 st.session_state.vin_attuale = vin_rilevato.upper().strip()
                 st.session_state.mostra_camera = False; st.rerun()
 
-    vin_corrente = st.selectbox("Veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    vin_corrente = st.selectbox("Mezzo scelto:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
     targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
-    st.warning(f"🚗 In Ispezione: {targa_corrente}")
+    st.warning(f"🚗 Ispezionando: {targa_corrente}")
 
     video = st.file_uploader("Carica Video", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
@@ -161,8 +170,9 @@ if menu == "🔍 Ispezione":
                 
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
+                if storico.lower() == "nan": storico = ""
                 
-                prompt = f"Analisi danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Nota se la targa nel video è diversa da {targa_corrente}."
+                prompt = f"Analisi dettagliata danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Verifica se la targa nel video e' effettivamente {targa_corrente}."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
                 
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
@@ -176,12 +186,9 @@ if menu == "🔍 Ispezione":
                 if salva_dati(df):
                     st.success("Analisi completata!")
                     st.markdown(ris_ai)
-                    try:
-                        pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
-                        st.download_button("📥 SCARICA REPORT PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
-                    except Exception as e:
-                        st.error(f"Errore PDF risolto: ricarica la pagina.")
-        else: st.warning("Metti il video!")
+                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
+                    st.download_button("📥 SCARICA REPORT PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
+        else: st.warning("Seleziona un video.")
 
 elif menu == "📂 Archivio":
     st.title("📂 Archivio Storico")
@@ -190,14 +197,14 @@ elif menu == "📂 Archivio":
     if idx_list:
         r = df.iloc[idx_list[0]]
         st.subheader(f"Mezzo: {r['Targa']}")
-        st.write(f"**Stato:** {r['Stato']} | **Data:** {r['Data']}")
-        if r['Report'] and str(r['Report']) != "":
+        st.write(f"Stato: {r['Stato']} | Data: {r['Data']}")
+        if r['Report'] and str(r['Report']).strip() != "":
             st.markdown("---")
             st.markdown(r['Report'])
-            try:
-                pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
-                st.download_button(label=f"📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
-            except: st.error("Errore generazione PDF nell'archivio.")
+            pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
+            st.download_button(label=f"📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
+    else:
+        st.write("Nessun dato.")
 
 elif menu == "👑 Admin":
     st.title("Admin")
