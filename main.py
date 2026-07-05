@@ -4,6 +4,7 @@ import os, cv2, pandas as pd, base64, requests, json, numpy as np
 from datetime import datetime
 import google.generativeai as genai
 from fpdf import FPDF
+import unicodedata
 
 # --- CONFIGURAZIONE API ---
 if "GEMINI_API_KEY" in st.secrets:
@@ -21,8 +22,8 @@ def seleziona_miglior_modello():
         for p in priorita:
             for m in modelli:
                 if p in m: return m
-        return "models/gemini-2.0-flash"
-    except: return "models/gemini-2.0-flash"
+        return "models/gemini-1.5-flash"
+    except: return "models/gemini-1.5-flash"
 
 MODELLO_ATTIVO = seleziona_miglior_modello()
 
@@ -64,17 +65,21 @@ def salva_dati(df_to_save):
     return True
 
 # --- FUNZIONI PDF E AI ---
-def crea_pdf_bytes(targa, vin, testo, stato):
+def pulisci_testo_pdf(testo):
+    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("–", "-")
+    nfkd_form = unicodedata.normalize('NFKD', testo)
+    return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).encode('latin-1', 'ignore').decode('latin-1')
+
+def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, f"REPORT PERIZIA VEICOLO: {targa}", ln=True, align="C")
     pdf.set_font("Helvetica", "", 10)
     pdf.cell(0, 8, f"Telaio (VIN): {vin}", ln=True, align="C")
-    pdf.cell(0, 8, f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
+    pdf.cell(0, 8, f"Data Ispezione: {data_report}", ln=True, align="C")
     pdf.ln(10)
     
-    # Colore esito
     if "OK" in stato: pdf.set_fill_color(200, 255, 200)
     else: pdf.set_fill_color(255, 200, 200)
     
@@ -82,9 +87,11 @@ def crea_pdf_bytes(targa, vin, testo, stato):
     pdf.cell(0, 10, f"STATO: {stato}", ln=True, align="C", fill=True)
     pdf.ln(5)
     pdf.set_font("Helvetica", "", 10)
-    clean_text = testo.replace("**", "").encode('latin-1', 'replace').decode('latin-1')
-    pdf.multi_cell(0, 7, clean_text)
-    return pdf.output(dest='S')
+    testo_sicuro = pulisci_testo_pdf(testo.replace("**", ""))
+    pdf.multi_cell(0, 7, testo_sicuro)
+    
+    out = pdf.output(dest='S')
+    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode('latin-1')
 
 def chiama_gemini(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
@@ -140,51 +147,62 @@ if menu == "🔍 Ispezione":
     video = st.file_uploader("Carica Video", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
         if video:
-            with st.spinner("Analisi..."):
+            with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame("temp.mp4")
                 
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
                 
-                prompt = f"Analisi danni {targa_corrente}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
+                prompt = f"Analisi dettagliata furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
                 
-                # Aggiornamento
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                df.at[idx, "Report"] = str(ris_ai)
-                df.at[idx, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                df.at[idx, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
+                testo_salvato = str(ris_ai)
+                data_ora = datetime.now().strftime("%d/%m/%Y %H:%M")
+                stato_f = "🚨 DANNI" if is_nuovo else "✅ OK"
+                
+                df.at[idx, "Report"] = testo_salvato
+                df.at[idx, "Data"] = data_ora
+                df.at[idx, "Stato"] = stato_f
                 
                 if salva_dati(df):
                     st.success("Analisi completata!")
                     st.markdown(ris_ai)
-                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, df.at[idx, "Stato"])
-                    st.download_button("📥 SCARICA PDF ORA", data=bytes(pdf_b), file_name=f"Report_{targa_corrente}.pdf")
+                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
+                    st.download_button("📥 SCARICA PDF ORA", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
         else: st.warning("Metti il video!")
 
 elif menu == "📂 Archivio":
-    st.title("📂 Archivio Report")
+    st.title("📂 Archivio Storico")
     vin_cerca = st.selectbox("Seleziona Veicolo:", LISTA_VIN)
-    idx = df.index[df['VIN'] == vin_cerca].tolist()[0]
-    r = df.iloc[idx]
-    
-    st.subheader(f"Mezzo: {r['Targa']}")
-    st.write(f"**Stato:** {r['Stato']} | **Data:** {r['Data']}")
-    
-    if r['Report']:
-        st.info(r['Report'])
-        # TASTO PDF SEMPRE DISPONIBILE NELL'ARCHIVIO
-        pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'])
-        st.download_button("📥 SCARICA REPORT PDF", data=bytes(pdf_b), file_name=f"Report_{r['Targa']}.pdf")
+    idx_list = df.index[df['VIN'] == vin_cerca].tolist()
+    if idx_list:
+        r = df.iloc[idx_list[0]]
+        st.subheader(f"Mezzo: {r['Targa']}")
+        st.write(f"**Stato:** {r['Stato']}")
+        st.write(f"**Data Ispezione:** {r['Data']}")
+        
+        if r['Report'] and r['Report'] != "":
+            st.markdown("---")
+            st.markdown(r['Report'])
+            # IL PDF VIENE RIGENERATO USANDO I DATI SALVATI NEL FOGLIO GOOGLE
+            try:
+                pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
+                st.download_button(
+                    label=f"📥 SCARICA PDF DEL {r['Data']}", 
+                    data=pdf_b, 
+                    file_name=f"Report_{r['Targa']}_{r['Data'].replace('/','-').replace(':','-')}.pdf", 
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"Errore generazione PDF: {e}")
     else:
-        st.write("Nessuna perizia registrata per questo veicolo.")
+        st.write("Seleziona un veicolo per vedere la cronologia.")
 
 elif menu == "👑 Admin":
     st.title("Admin")
     if st.text_input("Password", type="password") == "GSSA2026":
         st.dataframe(df, use_container_width=True)
-        if st.button("🔄 SINCRONIZZA TUTTO"):
-            if salva_dati(df): st.success("Dati aggiornati!")
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
