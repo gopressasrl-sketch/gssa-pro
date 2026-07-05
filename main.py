@@ -2,17 +2,31 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import os, cv2, pandas as pd, base64, requests, json, numpy as np
 from datetime import datetime
-from fpdf import FPDF
+import google.generativeai as genai
 
-# --- CONFIGURAZIONE API GEMINI ---
+# --- CONFIGURAZIONE API ---
 if "GEMINI_API_KEY" in st.secrets:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 else:
     API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODELLO_API = "gemini-2.0-flash" 
+genai.configure(api_key=API_KEY)
 
-# --- MAPPATURA UFFICIALE VIN <-> TARGA ---
+# --- AUTO-SELEZIONE MODELLO 2026 ---
+@st.cache_resource
+def seleziona_miglior_modello():
+    try:
+        modelli = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        priorita = ["3.5", "3.1", "3.0", "2.5", "2.0"]
+        for p in priorita:
+            for m in modelli:
+                if p in m: return m
+        return "models/gemini-2.0-flash"
+    except: return "models/gemini-2.0-flash"
+
+MODELLO_ATTIVO = seleziona_miglior_modello()
+
+# --- MAPPATURA VIN <-> TARGA ---
 MAPPA_VIN_TARGA = {
     "VF7YAANFA12S97743": "GG730AV", "VF7YAANFA12T50337": "GG206JK",
     "VF7YAANFA12T90153": "GG243ZM", "VF7YAANFA12T70979": "GG677RR",
@@ -31,58 +45,20 @@ MAPPA_VIN_TARGA = {
     "VF3VLEHT2SU318132": "HA953FV", "VF3VLEHT0SU318131": "HA957FV",
     "ZFA250005SMB27620": "GZ532JY"
 }
-
 LISTA_VIN = list(MAPPA_VIN_TARGA.keys())
-LISTA_TARGHE = list(MAPPA_VIN_TARGA.values())
 
-# --- CONNESSIONE GOOGLE SHEETS ---
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error("Errore di configurazione Google Sheets nei Secrets.")
-
+# --- DATABASE ---
+conn = st.connection("gsheets", type=GSheetsConnection)
 def carica_dati():
-    try:
-        return conn.read(worksheet="ispezioni", ttl="0s")
-    except Exception:
-        # Se il foglio non è accessibile, creiamo un database temporaneo per non bloccare l'app
-        data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
-        return pd.DataFrame(data)
+    try: return conn.read(worksheet="ispezioni", ttl="0s")
+    except: return pd.DataFrame([{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()])
 
-# --- FUNZIONI DI SCANSIONE (QR E OCR) ---
-def leggi_qr(image_file):
-    file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, 1)
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(img)
-    return data.upper().strip()
-
-def leggi_targa_ia(image_file):
-    img_bytes = base64.b64encode(image_file.read()).decode('utf-8')
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELLO_API}:generateContent?key={API_KEY}"
-    payload = {
-        "contents": [{"parts": [
-            {"text": "Leggi la targa automobilistica italiana in questa foto. Rispondi solo con la targa senza spazi."},
-            {"inline_data": {"mime_type": "image/jpeg", "data": img_bytes}}
-        ]}]
-    }
-    try:
-        res = requests.post(url, json=payload)
-        return res.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-    except: return ""
-
-# --- ANALISI PERITALE VIDEO ---
 def chiama_gemini_ispezione(prompt, frames_b64):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELLO_API}:generateContent?key={API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
-    payload = {
-        "contents": [{"parts": [{"text": prompt}] + inline_data}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=60)
-        return res.json()['candidates'][0]['content']['parts'][0]['text']
-    except: return "Errore di comunicazione con l'IA."
+    payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
+    res = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload), timeout=120)
+    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
 
 def estrai_frame_base64(video_path):
     frames = []
@@ -92,99 +68,80 @@ def estrai_frame_base64(video_path):
     for i in range(40):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step); ret, frame = cap.read()
         if not ret: break
-        _, buff = cv2.imencode('.jpg', cv2.resize(frame, (640, 480)), [cv2.IMWRITE_JPEG_QUALITY, 70])
+        _, buff = cv2.imencode('.jpg', cv2.resize(frame, (640, 480)), [cv2.IMWRITE_JPEG_QUALITY, 65])
         frames.append(base64.b64encode(buff).decode('utf-8'))
     cap.release()
     return frames
 
-# --- INTERFACCIA APP ---
-st.set_page_config(page_title="GSSA SMART SCAN", layout="wide", page_icon="🚚")
+# --- UI APP ---
+st.set_page_config(page_title="GSSA PRO QR", layout="wide")
 df = carica_dati()
 
-# Gestione della selezione veicolo tra i vari refresh della pagina
-if 'vin_attuale' not in st.session_state: 
-    st.session_state.vin_attuale = LISTA_VIN[0]
+# Inizializzazione degli stati della sessione
+if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_VIN[0]
+if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = False
 
-st.sidebar.title("💎 GSSA PRO v4.5")
-menu = st.sidebar.radio("Navigazione", ["🔍 Nuova Ispezione", "📂 Archivio Flotta", "👑 Area Admin"])
+st.sidebar.title("💎 GSSA PRO v5.1")
+st.sidebar.info(f"AI: {MODELLO_ATTIVO.split('/')[-1]}")
+menu = st.sidebar.radio("Menu", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
-if menu == "🔍 Nuova Ispezione":
-    st.title("🚀 Identifica Veicolo")
-    
-    scelta_metodo = st.radio("Metodo di identificazione:", ["QR Code (VIN)", "Scansione Targa (AI)", "Selezione Manuale"], horizontal=True)
-    
-    if scelta_metodo == "QR Code (VIN)":
-        foto_qr = st.camera_input("Inquadra il QR Code sul telaio")
-        if foto_qr:
-            vin_letto = leggi_qr(foto_qr)
-            if vin_letto in LISTA_VIN:
-                st.session_state.vin_attuale = vin_letto
-                st.success(f"✅ Riconosciuto VIN: {vin_letto} ({MAPPA_VIN_TARGA[vin_letto]})")
-            else: st.error("QR non valido o veicolo non in flotta.")
+if menu == "🔍 Ispezione":
+    st.title("🚀 Avvia Ispezione Mezzo")
 
-    elif scelta_metodo == "Scansione Targa (AI)":
-        foto_targa = st.camera_input("Scatta una foto alla targa")
-        if foto_targa:
-            with st.spinner("Riconoscimento targa in corso..."):
-                t_letta = "".join(filter(str.isalnum, leggi_targa_ia(foto_targa)))
-                if t_letta in LISTA_TARGHE:
-                    v_trovato = [v for v, t in MAPPA_VIN_TARGA.items() if t == t_letta][0]
-                    st.session_state.vin_attuale = v_trovato
-                    st.success(f"✅ Targa riconosciuta: {t_letta}")
-                else: st.error(f"Targa {t_letta} non trovata nel database.")
+    # BOTTONE PER APRIRE LA CAMERA
+    if not st.session_state.mostra_camera:
+        if st.button("📷 SCANSIONA VIN (QR CODE)", use_container_width=True):
+            st.session_state.mostra_camera = True
+            st.rerun()
+    else:
+        if st.button("❌ CHIUDI FOTOCAMERA", use_container_width=True):
+            st.session_state.mostra_camera = False
+            st.rerun()
+        
+        # CAMERA INPUT (Appare solo se mostrata_camera è True)
+        qr_img = st.camera_input("Inquadra il codice VIN sul furgone")
+        if qr_img:
+            file_bytes = np.asarray(bytearray(qr_img.read()), dtype=np.uint8)
+            img = cv2.imdecode(file_bytes, 1)
+            detector = cv2.QRCodeDetector()
+            vin_rilevato, _, _ = detector.detectAndDecode(img)
+            
+            if vin_rilevato.upper().strip() in LISTA_VIN:
+                st.session_state.vin_attuale = vin_rilevato.upper().strip()
+                st.session_state.mostra_camera = False # Chiude la camera automaticamente
+                st.success(f"✅ VEICOLO RICONOSCIUTO: {MAPPA_VIN_TARGA[st.session_state.vin_attuale]}")
+                st.rerun()
+            else:
+                st.error("❌ QR non valido. Riprova o seleziona manualmente.")
 
-    # Selettore finale (si aggiorna con le scansioni sopra)
-    vin_corrente = st.selectbox("Veicolo sotto ispezione:", LISTA_VIN, 
-                                index=LISTA_VIN.index(st.session_state.vin_attuale))
-    targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
-    
-    st.warning(f"Ispezione attiva per: **{targa_corrente}** (VIN: {vin_corrente})")
+    # SELEZIONE E VIDEO
+    st.divider()
+    vin_corrente = st.selectbox("Veicolo selezionato:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    st.warning(f"🚗 Ispezione per: **{MAPPA_VIN_TARGA[vin_corrente]}**")
 
-    video = st.file_uploader("📷 Registra Video Giro Mezzo", type=["mp4", "mov"])
-    
-    if st.button("🚀 AVVIA ANALISI PERITALE"):
+    video = st.file_uploader("📷 Carica Video Giro Mezzo", type=["mp4", "mov"])
+    if st.button("🚀 AVVIA ANALISI TOTALE"):
         if video:
-            with st.spinner("L'intelligenza artificiale sta analizzando il video..."):
+            with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame_base64("temp.mp4")
-                
-                # Cerca lo storico
                 riga = df[df["VIN"] == vin_corrente]
                 storico = str(riga.iloc[0]["Report"]) if not riga.empty and pd.notna(riga.iloc[0]["Report"]) else "Nessuno"
-                
-                prompt = f"Perizia professionale veicolo {targa_corrente}. Storico: {storico}. Elenca nuovi danni o scrivi 'NESSUN NUOVO DANNO'."
+                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca solo NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini_ispezione(prompt, b64_imgs)
-                
-                is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                
-                # Aggiornamento Database
-                df.loc[df["VIN"] == vin_corrente, "Report"] = ris_ai if is_nuovo or storico == "Nessuno" else storico
-                df.loc[df["VIN"] == vin_corrente, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                df.loc[df["VIN"] == vin_corrente, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
-                
-                try:
-                    conn.update(worksheet="ispezioni", data=df)
-                    st.success("Analisi salvata su Google Sheets!")
-                except:
-                    st.error("Errore nel salvataggio su Cloud. Controlla i permessi del foglio.")
-                
-                st.subheader("Esito AI:")
                 st.markdown(ris_ai)
-        else:
-            st.warning("Carica un video per iniziare.")
-
-elif menu == "📂 Archivio Flotta":
-    st.title("📂 Storico Veicoli")
-    vin_cerca = st.selectbox("Seleziona Veicolo:", LISTA_VIN)
-    r = df[df["VIN"] == vin_cerca].iloc[0]
-    st.subheader(f"Mezzo: {MAPPA_VIN_TARGA[vin_cerca]}")
-    st.write(f"Stato: {r['Stato']} | Data: {r['Data']}")
-    st.info(r["Report"] if r["Report"] else "Nessun report presente.")
+                if "Errore" not in ris_ai:
+                    is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
+                    df.loc[df["VIN"] == vin_corrente, "Report"] = ris_ai if is_nuovo or storico == "Nessuno" else storico
+                    df.loc[df["VIN"] == vin_corrente, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    df.loc[df["VIN"] == vin_corrente, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
+                    conn.update(worksheet="ispezioni", data=df)
+                    st.success("Sincronizzato!")
+        else: st.warning("Carica il video!")
 
 elif menu == "👑 Admin":
-    st.title("👑 Pannello Amministratore")
+    st.title("👑 Admin Panel")
     if st.text_input("Password", type="password") == "GSSA2026":
         st.dataframe(df, use_container_width=True)
-        st.download_button("📊 Scarica Database CSV", df.to_csv(index=False), "flotta.csv")
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
