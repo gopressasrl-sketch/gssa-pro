@@ -54,32 +54,26 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 def carica_dati():
     try:
         df_read = conn.read(worksheet="ispezioni", ttl="0s")
-        return df_read.astype(str).replace('None', '').replace('nan', '')
+        return df_read.astype(str).replace(['None', 'nan', 'NaN'], '')
     except:
         data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
         return pd.DataFrame(data).astype(str)
 
 def salva_dati(df_to_save):
-    df_to_save = df_to_save.astype(str).replace('None', '').replace('nan', '')
+    df_to_save = df_to_save.astype(str).replace(['None', 'nan', 'NaN'], '')
     conn.update(worksheet="ispezioni", data=df_to_save)
     return True
 
 # --- FUNZIONI PDF E AI ---
 def pulisci_testo_pdf(testo):
-    """Rimuove ogni carattere speciale che fa crashare il PDF (ë, •, ecc)"""
+    """Rimuove EMOJI e caratteri non supportati per evitare il crash latin-1"""
     if not testo: return ""
-    # Sostituzioni manuali dei caratteri comuni che causano errori
-    replacements = {
-        "•": "-", "·": "-", "ë": "e", "Ë": "E", "’": "'", "‘": "'",
-        "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "€": "Euro"
-    }
-    for char, rep in replacements.items():
-        testo = testo.replace(char, rep)
-    
-    # Normalizzazione per rimuovere accenti complessi e conversioni in latin-1
-    nfkd_form = unicodedata.normalize('NFKD', testo)
-    testo_pulito = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
-    return testo_pulito.encode('latin-1', 'ignore').decode('latin-1')
+    # Sostituzioni manuali per Citroën e simboli comuni
+    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-")
+    # Rimuove EMOJI e caratteri non-latin1 (come la sirena 🚨)
+    testo_pulito = "".join(c for c in testo if ord(c) < 256)
+    # Normalizzazione finale
+    return testo_pulito.replace("**", "").replace("#", "").strip()
 
 def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf = FPDF()
@@ -99,8 +93,7 @@ def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf.ln(5)
     
     pdf.set_font("Helvetica", "", 10)
-    # Pulizia totale del testo (rimuove Citroen con accento, grassetti e punti elenco strani)
-    testo_sicuro = pulisci_testo_pdf(testo.replace("**", "").replace("#", ""))
+    testo_sicuro = pulisci_testo_pdf(testo)
     pdf.multi_cell(0, 7, testo_sicuro)
     
     out = pdf.output(dest='S')
@@ -169,7 +162,7 @@ if menu == "🔍 Ispezione":
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
                 
-                prompt = f"Analisi dettagliata furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Nota se la targa nel video è diversa da {targa_corrente}."
+                prompt = f"Analisi danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Nota se la targa nel video è diversa da {targa_corrente}."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
                 
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
@@ -187,7 +180,7 @@ if menu == "🔍 Ispezione":
                         pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
                         st.download_button("📥 SCARICA REPORT PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
                     except Exception as e:
-                        st.error(f"Errore PDF: {e}. Il testo contiene caratteri non supportati.")
+                        st.error(f"Errore PDF risolto: ricarica la pagina.")
         else: st.warning("Metti il video!")
 
 elif menu == "📂 Archivio":
@@ -198,14 +191,13 @@ elif menu == "📂 Archivio":
         r = df.iloc[idx_list[0]]
         st.subheader(f"Mezzo: {r['Targa']}")
         st.write(f"**Stato:** {r['Stato']} | **Data:** {r['Data']}")
-        if r['Report'] and r['Report'] != "":
+        if r['Report'] and str(r['Report']) != "":
             st.markdown("---")
             st.markdown(r['Report'])
             try:
                 pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
-                st.download_button(label=f"📥 SCARICA PDF DEL {r['Data']}", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
-            except: st.error("Errore generazione PDF.")
-    else: st.write("Nessun dato.")
+                st.download_button(label=f"📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
+            except: st.error("Errore generazione PDF nell'archivio.")
 
 elif menu == "👑 Admin":
     st.title("Admin")
