@@ -53,17 +53,23 @@ def carica_dati():
     try:
         df_read = conn.read(worksheet="ispezioni", ttl="0s")
         if df_read.empty or len(df_read) < 2:
-            return pd.DataFrame([{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()])
+            raise ValueError("Foglio Vuoto")
+        # FORZIAMO TUTTO A STRINGA per evitare TypeError
+        df_read = df_read.astype(str).replace('nan', '')
         return df_read
     except:
-        return pd.DataFrame([{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()])
+        data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
+        df_new = pd.DataFrame(data).astype(str)
+        return df_new
 
 def salva_dati(df_to_save):
     try:
+        # Pulizia finale prima del salvataggio
+        df_to_save = df_to_save.astype(str).replace('nan', '')
         conn.update(worksheet="ispezioni", data=df_to_save)
         return True
     except Exception as e:
-        st.error(f"Errore salvataggio Google Sheets: {e}")
+        st.error(f"Errore salvataggio: {e}")
         return False
 
 def chiama_gemini_ispezione(prompt, frames_b64):
@@ -71,7 +77,9 @@ def chiama_gemini_ispezione(prompt, frames_b64):
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
     payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
     res = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload), timeout=120)
-    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
+    if res.status_code == 200:
+        return res.json()['candidates'][0]['content']['parts'][0]['text']
+    return "Errore AI"
 
 def estrai_frame_base64(video_path):
     frames = []
@@ -81,7 +89,7 @@ def estrai_frame_base64(video_path):
     for i in range(40):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step); ret, frame = cap.read()
         if not ret: break
-        _, buff = cv2.imencode('.jpg', cv2.resize(frame, (640, 480)), [cv2.IMWRITE_JPEG_QUALITY, 65])
+        _, buff = cv2.imencode('.jpg', cv2.resize(frame, (640, 480)), [cv2.IMWRITE_JPEG_QUALITY, 60])
         frames.append(base64.b64encode(buff).decode('utf-8'))
     cap.release()
     return frames
@@ -119,50 +127,44 @@ if menu == "🔍 Ispezione":
                 st.rerun()
 
     st.divider()
-    vin_corrente = st.selectbox("Veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    vin_corrente = st.selectbox("Seleziona veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
     st.warning(f"🚗 In ispezione: **{MAPPA_VIN_TARGA[vin_corrente]}**")
 
     video = st.file_uploader("Carica Video", type=["mp4", "mov"])
-    if st.button("🚀 ANALIZZA"):
+    if st.button("🚀 AVVIA ANALISI"):
         if video:
-            with st.spinner("Analisi e salvataggio..."):
+            with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame_base64("temp.mp4")
                 
-                # Trova indice o riga
-                riga_filtro = df[df['VIN'] == vin_corrente]
-                storico = "Nessuno"
-                if not riga_filtro.empty:
-                    storico = str(riga_filtro.iloc[0]["Report"])
+                # Trova la riga
+                riga_data = df[df['VIN'] == vin_corrente]
+                storico = str(riga_data.iloc[0]["Report"]) if not riga_data.empty else ""
                 
-                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca nuovi danni o scrivi 'NESSUN NUOVO DANNO'."
+                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini_ispezione(prompt, b64_imgs)
                 st.markdown(ris_ai)
                 
                 if "Errore" not in ris_ai:
                     is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
                     
-                    # Aggiorna il dataframe locale
+                    # Aggiornamento SICURO (con conversione a stringa)
                     idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
-                    df.at[idx, "Report"] = ris_ai if is_nuovo or storico == "Nessuno" else storico
+                    df.at[idx, "Report"] = str(ris_ai) if is_nuovo or storico == "" else str(storico)
                     df.at[idx, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
                     df.at[idx, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
                     
-                    # Tenta il salvataggio
                     if salva_dati(df):
-                        st.success("Analisi salvata correttamente su Google Sheets!")
-        else: st.warning("Carica il video!")
+                        st.success("Analisi salvata su Google Sheets!")
+        else: st.warning("Metti il video!")
 
 elif menu == "👑 Admin":
-    st.title("Pannello Admin")
+    st.title("Admin")
     pw = st.text_input("Password", type="password")
     if pw == "GSSA2026":
-        st.write("Dati attuali della flotta:")
         st.dataframe(df, use_container_width=True)
-        
         if st.button("🔄 FORZA SINCRONIZZAZIONE (Ripristina Foglio Google)"):
             if salva_dati(df):
-                st.success("Tutte le targhe sono state caricate sul foglio Google!")
-                st.rerun()
+                st.success("Tutte le targhe caricate!")
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
