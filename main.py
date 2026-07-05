@@ -4,7 +4,7 @@ import os, cv2, pandas as pd, base64, requests, json, numpy as np
 from datetime import datetime
 from fpdf import FPDF
 
-# --- CONFIGURAZIONE API ---
+# --- CONFIGURAZIONE API GEMINI ---
 if "GEMINI_API_KEY" in st.secrets:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 else:
@@ -36,18 +36,20 @@ LISTA_VIN = list(MAPPA_VIN_TARGA.keys())
 LISTA_TARGHE = list(MAPPA_VIN_TARGA.values())
 
 # --- CONNESSIONE GOOGLE SHEETS ---
-conn = st.connection("gsheets", type=GSheetsConnection)
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception as e:
+    st.error("Errore di configurazione Google Sheets nei Secrets.")
 
 def carica_dati():
     try:
         return conn.read(worksheet="ispezioni", ttl="0s")
-    except:
+    except Exception:
+        # Se il foglio non è accessibile, creiamo un database temporaneo per non bloccare l'app
         data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
-        df_ini = pd.DataFrame(data)
-        conn.update(worksheet="ispezioni", data=df_ini)
-        return df_ini
+        return pd.DataFrame(data)
 
-# --- FUNZIONI DI SCANSIONE ---
+# --- FUNZIONI DI SCANSIONE (QR E OCR) ---
 def leggi_qr(image_file):
     file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, 1)
@@ -56,7 +58,6 @@ def leggi_qr(image_file):
     return data.upper().strip()
 
 def leggi_targa_ia(image_file):
-    """Usa Gemini per leggere la targa dalla foto"""
     img_bytes = base64.b64encode(image_file.read()).decode('utf-8')
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELLO_API}:generateContent?key={API_KEY}"
     payload = {
@@ -65,17 +66,23 @@ def leggi_targa_ia(image_file):
             {"inline_data": {"mime_type": "image/jpeg", "data": img_bytes}}
         ]}]
     }
-    res = requests.post(url, json=payload)
-    if res.status_code == 200:
+    try:
+        res = requests.post(url, json=payload)
         return res.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-    return ""
+    except: return ""
 
+# --- ANALISI PERITALE VIDEO ---
 def chiama_gemini_ispezione(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODELLO_API}:generateContent?key={API_KEY}"
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
-    payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
-    res = requests.post(url, json=payload)
-    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}] + inline_data}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=60)
+        return res.json()['candidates'][0]['content']['parts'][0]['text']
+    except: return "Errore di comunicazione con l'IA."
 
 def estrai_frame_base64(video_path):
     frames = []
@@ -90,74 +97,94 @@ def estrai_frame_base64(video_path):
     cap.release()
     return frames
 
-# --- INTERFACCIA ---
-st.set_page_config(page_title="GSSA SMART SCAN", layout="wide")
+# --- INTERFACCIA APP ---
+st.set_page_config(page_title="GSSA SMART SCAN", layout="wide", page_icon="🚚")
 df = carica_dati()
 
-if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_VIN[0]
+# Gestione della selezione veicolo tra i vari refresh della pagina
+if 'vin_attuale' not in st.session_state: 
+    st.session_state.vin_attuale = LISTA_VIN[0]
 
 st.sidebar.title("💎 GSSA PRO v4.5")
-menu = st.sidebar.radio("Menu", ["🔍 Ispezione Rapida", "📂 Archivio", "👑 Admin"])
+menu = st.sidebar.radio("Navigazione", ["🔍 Nuova Ispezione", "📂 Archivio Flotta", "👑 Area Admin"])
 
-if menu == "🔍 Ispezione Rapida":
+if menu == "🔍 Nuova Ispezione":
     st.title("🚀 Identifica Veicolo")
     
-    metodo = st.radio("Scegli come identificare il mezzo:", ["Scansiona QR (VIN)", "Scansiona Targa (OCR)", "Selezione Manuale"])
+    scelta_metodo = st.radio("Metodo di identificazione:", ["QR Code (VIN)", "Scansione Targa (AI)", "Selezione Manuale"], horizontal=True)
     
-    if metodo == "Scansiona QR (VIN)":
+    if scelta_metodo == "QR Code (VIN)":
         foto_qr = st.camera_input("Inquadra il QR Code sul telaio")
         if foto_qr:
             vin_letto = leggi_qr(foto_qr)
             if vin_letto in LISTA_VIN:
                 st.session_state.vin_attuale = vin_letto
                 st.success(f"✅ Riconosciuto VIN: {vin_letto} ({MAPPA_VIN_TARGA[vin_letto]})")
-            else: st.error("QR non valido o non in flotta.")
+            else: st.error("QR non valido o veicolo non in flotta.")
 
-    elif metodo == "Scansiona Targa (OCR)":
-        foto_targa = st.camera_input("Inquadra la targa del furgone")
+    elif scelta_metodo == "Scansione Targa (AI)":
+        foto_targa = st.camera_input("Scatta una foto alla targa")
         if foto_targa:
-            with st.spinner("L'IA sta leggendo la targa..."):
-                targa_letta = leggi_targa_ia(foto_targa)
-                # Pulizia targa letta (rimuove spazi o caratteri strani)
-                targa_letta = "".join(filter(str.isalnum, targa_letta))
-                if targa_letta in LISTA_TARGHE:
-                    # Trova il VIN corrispondente alla targa
-                    vin_trovato = [v for v, t in MAPPA_VIN_TARGA.items() if t == targa_letta][0]
-                    st.session_state.vin_attuale = vin_trovato
-                    st.success(f"✅ Targa riconosciuta: {targa_letta}")
-                else: st.error(f"Targa {targa_letta} non trovata in flotta.")
+            with st.spinner("Riconoscimento targa in corso..."):
+                t_letta = "".join(filter(str.isalnum, leggi_targa_ia(foto_targa)))
+                if t_letta in LISTA_TARGHE:
+                    v_trovato = [v for v, t in MAPPA_VIN_TARGA.items() if t == t_letta][0]
+                    st.session_state.vin_attuale = v_trovato
+                    st.success(f"✅ Targa riconosciuta: {t_letta}")
+                else: st.error(f"Targa {t_letta} non trovata nel database.")
 
-    # Riepilogo selezione
-    vin_corrente = st.selectbox("Veicolo selezionato:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    # Selettore finale (si aggiorna con le scansioni sopra)
+    vin_corrente = st.selectbox("Veicolo sotto ispezione:", LISTA_VIN, 
+                                index=LISTA_VIN.index(st.session_state.vin_attuale))
     targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
-    st.info(f"🚗 **Ispezione pronta per:** {targa_corrente} | **Telaio:** {vin_corrente}")
+    
+    st.warning(f"Ispezione attiva per: **{targa_corrente}** (VIN: {vin_corrente})")
 
-    # Analisi Video
-    video = st.file_uploader("📷 Registra o carica il video del giro mezzo", type=["mp4", "mov"])
-    if st.button("🚀 AVVIA PERIZIA"):
+    video = st.file_uploader("📷 Registra Video Giro Mezzo", type=["mp4", "mov"])
+    
+    if st.button("🚀 AVVIA ANALISI PERITALE"):
         if video:
-            with st.spinner("Analisi peritale in corso..."):
+            with st.spinner("L'intelligenza artificiale sta analizzando il video..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame_base64("temp.mp4")
-                storico = str(df[df["VIN"] == vin_corrente].iloc[0]["Report"])
                 
-                prompt = f"Perizia {targa_corrente}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
+                # Cerca lo storico
+                riga = df[df["VIN"] == vin_corrente]
+                storico = str(riga.iloc[0]["Report"]) if not riga.empty and pd.notna(riga.iloc[0]["Report"]) else "Nessuno"
+                
+                prompt = f"Perizia professionale veicolo {targa_corrente}. Storico: {storico}. Elenca nuovi danni o scrivi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini_ispezione(prompt, b64_imgs)
                 
-                # Aggiornamento DB
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                df.loc[df["VIN"] == vin_corrente, "Report"] = ris_ai if is_nuovo else storico
+                
+                # Aggiornamento Database
+                df.loc[df["VIN"] == vin_corrente, "Report"] = ris_ai if is_nuovo or storico == "Nessuno" else storico
                 df.loc[df["VIN"] == vin_corrente, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
                 df.loc[df["VIN"] == vin_corrente, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
-                conn.update(worksheet="ispezioni", data=df)
                 
-                st.subheader("Risultato:")
+                try:
+                    conn.update(worksheet="ispezioni", data=df)
+                    st.success("Analisi salvata su Google Sheets!")
+                except:
+                    st.error("Errore nel salvataggio su Cloud. Controlla i permessi del foglio.")
+                
+                st.subheader("Esito AI:")
                 st.markdown(ris_ai)
-        else: st.warning("Carica il video!")
+        else:
+            st.warning("Carica un video per iniziare.")
+
+elif menu == "📂 Archivio Flotta":
+    st.title("📂 Storico Veicoli")
+    vin_cerca = st.selectbox("Seleziona Veicolo:", LISTA_VIN)
+    r = df[df["VIN"] == vin_cerca].iloc[0]
+    st.subheader(f"Mezzo: {MAPPA_VIN_TARGA[vin_cerca]}")
+    st.write(f"Stato: {r['Stato']} | Data: {r['Data']}")
+    st.info(r["Report"] if r["Report"] else "Nessun report presente.")
 
 elif menu == "👑 Admin":
-    st.title("👑 Admin")
+    st.title("👑 Pannello Amministratore")
     if st.text_input("Password", type="password") == "GSSA2026":
-        st.dataframe(df)
+        st.dataframe(df, use_container_width=True)
+        st.download_button("📊 Scarica Database CSV", df.to_csv(index=False), "flotta.csv")
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
