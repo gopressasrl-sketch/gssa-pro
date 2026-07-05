@@ -144,4 +144,47 @@ if menu == "🔍 Ispezione":
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame("temp.mp4")
                 
-                idx = df.index[df['VIN'] == vin_corren
+                idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
+                storico = str(df.at[idx, "Report"])
+                
+                prompt = f"Analisi danni {targa_corrente}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
+                ris_ai = chiama_gemini(prompt, b64_imgs)
+                
+                # Aggiornamento
+                is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
+                df.at[idx, "Report"] = str(ris_ai)
+                df.at[idx, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+                df.at[idx, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
+                
+                if salva_dati(df):
+                    st.success("Analisi completata!")
+                    st.markdown(ris_ai)
+                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, df.at[idx, "Stato"])
+                    st.download_button("📥 SCARICA PDF ORA", data=bytes(pdf_b), file_name=f"Report_{targa_corrente}.pdf")
+        else: st.warning("Metti il video!")
+
+elif menu == "📂 Archivio":
+    st.title("📂 Archivio Report")
+    vin_cerca = st.selectbox("Seleziona Veicolo:", LISTA_VIN)
+    idx = df.index[df['VIN'] == vin_cerca].tolist()[0]
+    r = df.iloc[idx]
+    
+    st.subheader(f"Mezzo: {r['Targa']}")
+    st.write(f"**Stato:** {r['Stato']} | **Data:** {r['Data']}")
+    
+    if r['Report']:
+        st.info(r['Report'])
+        # TASTO PDF SEMPRE DISPONIBILE NELL'ARCHIVIO
+        pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'])
+        st.download_button("📥 SCARICA REPORT PDF", data=bytes(pdf_b), file_name=f"Report_{r['Targa']}.pdf")
+    else:
+        st.write("Nessuna perizia registrata per questo veicolo.")
+
+elif menu == "👑 Admin":
+    st.title("Admin")
+    if st.text_input("Password", type="password") == "GSSA2026":
+        st.dataframe(df, use_container_width=True)
+        if st.button("🔄 SINCRONIZZA TUTTO"):
+            if salva_dati(df): st.success("Dati aggiornati!")
+
+if os.path.exists("temp.mp4"): os.remove("temp.mp4")
