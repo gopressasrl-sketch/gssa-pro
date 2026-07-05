@@ -66,9 +66,20 @@ def salva_dati(df_to_save):
 
 # --- FUNZIONI PDF E AI ---
 def pulisci_testo_pdf(testo):
-    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("–", "-")
+    """Rimuove ogni carattere speciale che fa crashare il PDF (ë, •, ecc)"""
+    if not testo: return ""
+    # Sostituzioni manuali dei caratteri comuni che causano errori
+    replacements = {
+        "•": "-", "·": "-", "ë": "e", "Ë": "E", "’": "'", "‘": "'",
+        "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "€": "Euro"
+    }
+    for char, rep in replacements.items():
+        testo = testo.replace(char, rep)
+    
+    # Normalizzazione per rimuovere accenti complessi e conversioni in latin-1
     nfkd_form = unicodedata.normalize('NFKD', testo)
-    return "".join([c for c in nfkd_form if not unicodedata.combining(c)]).encode('latin-1', 'ignore').decode('latin-1')
+    testo_pulito = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+    return testo_pulito.encode('latin-1', 'ignore').decode('latin-1')
 
 def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf = FPDF()
@@ -86,8 +97,10 @@ def crea_pdf_bytes(targa, vin, testo, stato, data_report):
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 10, f"STATO: {stato}", ln=True, align="C", fill=True)
     pdf.ln(5)
+    
     pdf.set_font("Helvetica", "", 10)
-    testo_sicuro = pulisci_testo_pdf(testo.replace("**", ""))
+    # Pulizia totale del testo (rimuove Citroen con accento, grassetti e punti elenco strani)
+    testo_sicuro = pulisci_testo_pdf(testo.replace("**", "").replace("#", ""))
     pdf.multi_cell(0, 7, testo_sicuro)
     
     out = pdf.output(dest='S')
@@ -98,7 +111,9 @@ def chiama_gemini(prompt, frames_b64):
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
     payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
     res = requests.post(url, json=payload, timeout=120)
-    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
+    if res.status_code == 200:
+        return res.json()['candidates'][0]['content']['parts'][0]['text']
+    return "Errore AI"
 
 def estrai_frame(video_path):
     frames = []
@@ -154,23 +169,25 @@ if menu == "🔍 Ispezione":
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
                 
-                prompt = f"Analisi dettagliata furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
+                prompt = f"Analisi dettagliata furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Nota se la targa nel video è diversa da {targa_corrente}."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
                 
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                testo_salvato = str(ris_ai)
                 data_ora = datetime.now().strftime("%d/%m/%Y %H:%M")
                 stato_f = "🚨 DANNI" if is_nuovo else "✅ OK"
                 
-                df.at[idx, "Report"] = testo_salvato
+                df.at[idx, "Report"] = str(ris_ai)
                 df.at[idx, "Data"] = data_ora
                 df.at[idx, "Stato"] = stato_f
                 
                 if salva_dati(df):
                     st.success("Analisi completata!")
                     st.markdown(ris_ai)
-                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
-                    st.download_button("📥 SCARICA PDF ORA", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
+                    try:
+                        pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
+                        st.download_button("📥 SCARICA REPORT PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
+                    except Exception as e:
+                        st.error(f"Errore PDF: {e}. Il testo contiene caratteri non supportati.")
         else: st.warning("Metti il video!")
 
 elif menu == "📂 Archivio":
@@ -180,25 +197,15 @@ elif menu == "📂 Archivio":
     if idx_list:
         r = df.iloc[idx_list[0]]
         st.subheader(f"Mezzo: {r['Targa']}")
-        st.write(f"**Stato:** {r['Stato']}")
-        st.write(f"**Data Ispezione:** {r['Data']}")
-        
+        st.write(f"**Stato:** {r['Stato']} | **Data:** {r['Data']}")
         if r['Report'] and r['Report'] != "":
             st.markdown("---")
             st.markdown(r['Report'])
-            # IL PDF VIENE RIGENERATO USANDO I DATI SALVATI NEL FOGLIO GOOGLE
             try:
                 pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
-                st.download_button(
-                    label=f"📥 SCARICA PDF DEL {r['Data']}", 
-                    data=pdf_b, 
-                    file_name=f"Report_{r['Targa']}_{r['Data'].replace('/','-').replace(':','-')}.pdf", 
-                    mime="application/pdf"
-                )
-            except Exception as e:
-                st.error(f"Errore generazione PDF: {e}")
-    else:
-        st.write("Seleziona un veicolo per vedere la cronologia.")
+                st.download_button(label=f"📥 SCARICA PDF DEL {r['Data']}", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
+            except: st.error("Errore generazione PDF.")
+    else: st.write("Nessun dato.")
 
 elif menu == "👑 Admin":
     st.title("Admin")
