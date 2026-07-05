@@ -3,6 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import os, cv2, pandas as pd, base64, requests, json, numpy as np
 from datetime import datetime
 import google.generativeai as genai
+from fpdf import FPDF
 
 # --- CONFIGURAZIONE API ---
 if "GEMINI_API_KEY" in st.secrets:
@@ -25,7 +26,7 @@ def seleziona_miglior_modello():
 
 MODELLO_ATTIVO = seleziona_miglior_modello()
 
-# --- MAPPATURA VIN <-> TARGA ---
+# --- MAPPATURA ---
 MAPPA_VIN_TARGA = {
     "VF7YAANFA12S97743": "GG730AV", "VF7YAANFA12T50337": "GG206JK",
     "VF7YAANFA12T90153": "GG243ZM", "VF7YAANFA12T70979": "GG677RR",
@@ -52,36 +53,47 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 def carica_dati():
     try:
         df_read = conn.read(worksheet="ispezioni", ttl="0s")
-        if df_read.empty or len(df_read) < 2:
-            raise ValueError("Foglio Vuoto")
-        # FORZIAMO TUTTO A STRINGA per evitare TypeError
-        df_read = df_read.astype(str).replace('nan', '')
-        return df_read
+        return df_read.astype(str).replace('None', '').replace('nan', '')
     except:
         data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
-        df_new = pd.DataFrame(data).astype(str)
-        return df_new
+        return pd.DataFrame(data).astype(str)
 
 def salva_dati(df_to_save):
-    try:
-        # Pulizia finale prima del salvataggio
-        df_to_save = df_to_save.astype(str).replace('nan', '')
-        conn.update(worksheet="ispezioni", data=df_to_save)
-        return True
-    except Exception as e:
-        st.error(f"Errore salvataggio: {e}")
-        return False
+    df_to_save = df_to_save.astype(str).replace('None', '').replace('nan', '')
+    conn.update(worksheet="ispezioni", data=df_to_save)
+    return True
 
-def chiama_gemini_ispezione(prompt, frames_b64):
+# --- FUNZIONI PDF E AI ---
+def crea_pdf_bytes(targa, vin, testo, stato):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"REPORT PERIZIA VEICOLO: {targa}", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 8, f"Telaio (VIN): {vin}", ln=True, align="C")
+    pdf.cell(0, 8, f"Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
+    pdf.ln(10)
+    
+    # Colore esito
+    if "OK" in stato: pdf.set_fill_color(200, 255, 200)
+    else: pdf.set_fill_color(255, 200, 200)
+    
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 10, f"STATO: {stato}", ln=True, align="C", fill=True)
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "", 10)
+    clean_text = testo.replace("**", "").encode('latin-1', 'replace').decode('latin-1')
+    pdf.multi_cell(0, 7, clean_text)
+    return pdf.output(dest='S')
+
+def chiama_gemini(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
     payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
-    res = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload), timeout=120)
-    if res.status_code == 200:
-        return res.json()['candidates'][0]['content']['parts'][0]['text']
-    return "Errore AI"
+    res = requests.post(url, json=payload, timeout=120)
+    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
 
-def estrai_frame_base64(video_path):
+def estrai_frame(video_path):
     frames = []
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -95,76 +107,41 @@ def estrai_frame_base64(video_path):
     return frames
 
 # --- UI APP ---
-st.set_page_config(page_title="GSSA", layout="wide")
+st.set_page_config(page_title="GSSA PRO", layout="wide")
 df = carica_dati()
 
 if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_VIN[0]
 if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = False
 
 st.sidebar.title("Furgoni GSSA")
-menu = st.sidebar.radio("Scegli:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
+menu = st.sidebar.radio("Naviga:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
-    st.title("Ispezione Mezzi")
-
+    st.title("Nuova Ispezione")
     if not st.session_state.mostra_camera:
         if st.button("📷 SCANSIONA VIN", use_container_width=True):
             st.session_state.mostra_camera = True
             st.rerun()
     else:
-        if st.button("❌ CHIUDI CAMERA", use_container_width=True):
-            st.session_state.mostra_camera = False
-            st.rerun()
-        qr_img = st.camera_input("Inquadra il codice VIN")
+        if st.button("❌ CHIUDI CAMERA"): st.session_state.mostra_camera = False; st.rerun()
+        qr_img = st.camera_input("Inquadra il VIN")
         if qr_img:
             file_bytes = np.asarray(bytearray(qr_img.read()), dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, 1)
             detector = cv2.QRCodeDetector()
-            vin_rilevato, _, _ = detector.detectAndDecode(img)
+            vin_rilevato, _, _ = detector.detectAndDecode(cv2.imdecode(file_bytes, 1))
             if vin_rilevato.upper().strip() in LISTA_VIN:
                 st.session_state.vin_attuale = vin_rilevato.upper().strip()
-                st.session_state.mostra_camera = False 
-                st.rerun()
+                st.session_state.mostra_camera = False; st.rerun()
 
-    st.divider()
-    vin_corrente = st.selectbox("Seleziona veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
-    st.warning(f"🚗 In ispezione: **{MAPPA_VIN_TARGA[vin_corrente]}**")
+    vin_corrente = st.selectbox("Veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
+    st.warning(f"🚗 In Ispezione: {targa_corrente}")
 
     video = st.file_uploader("Carica Video", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
         if video:
-            with st.spinner("Analisi in corso..."):
+            with st.spinner("Analisi..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
-                b64_imgs = estrai_frame_base64("temp.mp4")
+                b64_imgs = estrai_frame("temp.mp4")
                 
-                # Trova la riga
-                riga_data = df[df['VIN'] == vin_corrente]
-                storico = str(riga_data.iloc[0]["Report"]) if not riga_data.empty else ""
-                
-                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
-                ris_ai = chiama_gemini_ispezione(prompt, b64_imgs)
-                st.markdown(ris_ai)
-                
-                if "Errore" not in ris_ai:
-                    is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
-                    
-                    # Aggiornamento SICURO (con conversione a stringa)
-                    idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
-                    df.at[idx, "Report"] = str(ris_ai) if is_nuovo or storico == "" else str(storico)
-                    df.at[idx, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-                    df.at[idx, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
-                    
-                    if salva_dati(df):
-                        st.success("Analisi salvata su Google Sheets!")
-        else: st.warning("Metti il video!")
-
-elif menu == "👑 Admin":
-    st.title("Admin")
-    pw = st.text_input("Password", type="password")
-    if pw == "GSSA2026":
-        st.dataframe(df, use_container_width=True)
-        if st.button("🔄 FORZA SINCRONIZZAZIONE (Ripristina Foglio Google)"):
-            if salva_dati(df):
-                st.success("Tutte le targhe caricate!")
-
-if os.path.exists("temp.mp4"): os.remove("temp.mp4")
+                idx = df.index[df['VIN'] == vin_corren
