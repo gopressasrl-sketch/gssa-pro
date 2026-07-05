@@ -74,32 +74,31 @@ def estrai_frame_base64(video_path):
     return frames
 
 # --- UI APP ---
-st.set_page_config(page_title="GSSA PRO QR", layout="wide")
+st.set_page_config(page_title="GSSA", layout="wide")
 df = carica_dati()
 
-# Inizializzazione degli stati della sessione
+# Inizializzazione sessione
 if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_VIN[0]
 if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = False
 
-st.sidebar.title("💎 GSSA PRO v5.1")
-st.sidebar.info(f"AI: {MODELLO_ATTIVO.split('/')[-1]}")
-menu = st.sidebar.radio("Menu", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
+# SIDEBAR PULITA
+st.sidebar.title("Furgoni GSSA")
+menu = st.sidebar.radio("Scegli operazione:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
-    st.title("🚀 Avvia Ispezione Mezzo")
+    st.title("Ispezione Mezzi")
 
-    # BOTTONE PER APRIRE LA CAMERA
+    # BOTTONE SCANSIONE
     if not st.session_state.mostra_camera:
-        if st.button("📷 SCANSIONA VIN (QR CODE)", use_container_width=True):
+        if st.button("📷 SCANSIONA VIN", use_container_width=True):
             st.session_state.mostra_camera = True
             st.rerun()
     else:
-        if st.button("❌ CHIUDI FOTOCAMERA", use_container_width=True):
+        if st.button("❌ CHIUDI CAMERA", use_container_width=True):
             st.session_state.mostra_camera = False
             st.rerun()
         
-        # CAMERA INPUT (Appare solo se mostrata_camera è True)
-        qr_img = st.camera_input("Inquadra il codice VIN sul furgone")
+        qr_img = st.camera_input("Inquadra il codice VIN")
         if qr_img:
             file_bytes = np.asarray(bytearray(qr_img.read()), dtype=np.uint8)
             img = cv2.imdecode(file_bytes, 1)
@@ -108,26 +107,23 @@ if menu == "🔍 Ispezione":
             
             if vin_rilevato.upper().strip() in LISTA_VIN:
                 st.session_state.vin_attuale = vin_rilevato.upper().strip()
-                st.session_state.mostra_camera = False # Chiude la camera automaticamente
-                st.success(f"✅ VEICOLO RICONOSCIUTO: {MAPPA_VIN_TARGA[st.session_state.vin_attuale]}")
+                st.session_state.mostra_camera = False 
+                st.success(f"Veicolo riconosciuto: {MAPPA_VIN_TARGA[st.session_state.vin_attuale]}")
                 st.rerun()
-            else:
-                st.error("❌ QR non valido. Riprova o seleziona manualmente.")
 
-    # SELEZIONE E VIDEO
     st.divider()
-    vin_corrente = st.selectbox("Veicolo selezionato:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
-    st.warning(f"🚗 Ispezione per: **{MAPPA_VIN_TARGA[vin_corrente]}**")
+    vin_corrente = st.selectbox("Seleziona veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    st.warning(f"🚗 Ispezione in corso: **{MAPPA_VIN_TARGA[vin_corrente]}**")
 
-    video = st.file_uploader("📷 Carica Video Giro Mezzo", type=["mp4", "mov"])
-    if st.button("🚀 AVVIA ANALISI TOTALE"):
+    video = st.file_uploader("Carica Video Giro Mezzo", type=["mp4", "mov"])
+    if st.button("🚀 ANALIZZA"):
         if video:
             with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame_base64("temp.mp4")
                 riga = df[df["VIN"] == vin_corrente]
                 storico = str(riga.iloc[0]["Report"]) if not riga.empty and pd.notna(riga.iloc[0]["Report"]) else "Nessuno"
-                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca solo NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
+                prompt = f"Analisi danni {MAPPA_VIN_TARGA[vin_corrente]}. Storico: {storico}. Elenca nuovi danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini_ispezione(prompt, b64_imgs)
                 st.markdown(ris_ai)
                 if "Errore" not in ris_ai:
@@ -136,11 +132,11 @@ if menu == "🔍 Ispezione":
                     df.loc[df["VIN"] == vin_corrente, "Data"] = datetime.now().strftime("%d/%m/%Y %H:%M")
                     df.loc[df["VIN"] == vin_corrente, "Stato"] = "🚨 DANNI" if is_nuovo else "✅ OK"
                     conn.update(worksheet="ispezioni", data=df)
-                    st.success("Sincronizzato!")
+                    st.success("Analisi salvata nel database!")
         else: st.warning("Carica il video!")
 
 elif menu == "👑 Admin":
-    st.title("👑 Admin Panel")
+    st.title("Pannello Amministratore")
     if st.text_input("Password", type="password") == "GSSA2026":
         st.dataframe(df, use_container_width=True)
 
