@@ -56,7 +56,7 @@ def carica_dati():
         df_read = conn.read(worksheet="ispezioni", ttl="0s")
         return df_read.fillna("").astype(str).replace(['None', 'nan', 'NaN'], '')
     except:
-        data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": ""} for v, t in MAPPA_VIN_TARGA.items()]
+        data = [{"VIN": v, "Targa": t, "Stato": "DA CONTROLLARE", "Data": "-", "Report": "", "Operatore": ""} for v, t in MAPPA_VIN_TARGA.items()]
         return pd.DataFrame(data).astype(str)
 
 def salva_dati(df_to_save):
@@ -64,65 +64,46 @@ def salva_dati(df_to_save):
     conn.update(worksheet="ispezioni", data=df_to_save)
     return True
 
-# --- FUNZIONI PDF (ULTRA SICURE) ---
-def pulizia_estrema_testo(testo):
-    """Rimuove EMOJI e caratteri non compatibili per evitare crash PDF"""
+# --- FUNZIONI PDF (Senza Emoji) ---
+def pulizia_per_pdf(testo):
     if not testo or testo == "nan": return "Nessun dettaglio."
-    
-    # Sostituzioni manuali per Citroen e simboli comuni
-    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-").replace("·", "-")
-    
-    # Rimuove accenti complessi (es. è -> e)
+    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-")
     nfkd_form = unicodedata.normalize('NFKD', testo)
     testo_no_accenti = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
-    
-    # Rimuove EMOJI (tutto ciò che non è ASCII standard)
     testo_finale = testo_no_accenti.encode('ascii', 'ignore').decode('ascii')
-    
-    # Pulizia Markdown (asterischi e cancelletti)
     return testo_finale.replace("**", "").replace("#", "").strip()
 
-def crea_pdf_bytes(targa, vin, testo, stato, data_report):
+def crea_pdf_bytes(targa, vin, testo, stato, data_report, operatore):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
-    
-    # Puliamo tutto prima di scrivere
-    targa_s = pulizia_estrema_testo(targa)
-    vin_s = pulizia_estrema_testo(vin)
-    stato_s = pulizia_estrema_testo(stato)
-    data_s = pulizia_estrema_testo(data_report)
-    testo_s = pulizia_estrema_testo(testo)
+    targa_s = pulizia_per_pdf(targa)
+    vin_s = pulizia_per_pdf(vin)
+    operatore_s = pulizia_per_pdf(operatore)
     
     pdf.cell(0, 10, f"REPORT PERIZIA VEICOLO: {targa_s}", ln=True, align="C")
     pdf.set_font("Arial", "", 10)
-    pdf.cell(0, 8, f"VIN: {vin_s} | Data: {data_s}", ln=True, align="C")
+    pdf.cell(0, 7, f"VIN: {vin_s} | Operatore: {operatore_s}", ln=True, align="C")
+    pdf.cell(0, 7, f"Data Ispezione: {data_report}", ln=True, align="C")
     pdf.ln(10)
     
-    # Colore stato (Verde se OK, Rosso se DANNI)
-    if "OK" in stato_s.upper(): pdf.set_fill_color(200, 255, 200)
+    if "OK" in stato.upper(): pdf.set_fill_color(200, 255, 200)
     else: pdf.set_fill_color(255, 200, 200)
     
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, f"STATO: {stato_s}", ln=True, align="C", fill=True)
+    pdf.cell(0, 10, f"STATO: {pulisci_per_pdf(stato)}", ln=True, align="C", fill=True)
     pdf.ln(5)
     
     pdf.set_font("Arial", "", 10)
-    pdf.multi_cell(0, 7, testo_s)
-    
-    # Generazione binaria
-    out = pdf.output(dest='S')
-    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode('latin-1', 'ignore')
+    pdf.multi_cell(0, 7, pulizia_per_pdf(testo))
+    return bytes(pdf.output(dest='S'))
 
-# --- FUNZIONI AI E VIDEO ---
 def chiama_gemini(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
     payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1}}
     res = requests.post(url, json=payload, timeout=120)
-    if res.status_code == 200:
-        return res.json()['candidates'][0]['content']['parts'][0]['text']
-    return "Errore AI"
+    return res.json()['candidates'][0]['content']['parts'][0]['text'] if res.status_code == 200 else "Errore AI"
 
 def estrai_frame(video_path):
     frames = []
@@ -139,20 +120,38 @@ def estrai_frame(video_path):
 
 # --- UI APP ---
 st.set_page_config(page_title="GSSA PRO", layout="wide")
-df = carica_dati()
 
+# --- GESTIONE ACCOUNT ---
+if 'user' not in st.session_state:
+    st.title("🚚 GSSA PRO - Accesso")
+    nome = st.text_input("Inserisci il tuo Nome")
+    cognome = st.text_input("Inserisci il tuo Cognome")
+    if st.button("ENTRA NELL'APP"):
+        if nome and cognome:
+            st.session_state.user = f"{nome.strip()} {cognome.strip()}".upper()
+            st.rerun()
+        else:
+            st.warning("Devi inserire Nome e Cognome per continuare.")
+    st.stop() # Blocca il resto dell'app finché non si effettua l'accesso
+
+# --- APP REALE (Dopo l'accesso) ---
+df = carica_dati()
 if 'vin_attuale' not in st.session_state: st.session_state.vin_attuale = LISTA_VIN[0]
 if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = False
 
 st.sidebar.title("Furgoni GSSA")
+st.sidebar.write(f"👤 Operatore: **{st.session_state.user}**")
+if st.sidebar.button("Esci / Cambia Utente"):
+    del st.session_state.user
+    st.rerun()
+
 menu = st.sidebar.radio("Naviga:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
-    st.title("Nuova Ispezione")
+    st.title("Ispezione Mezzi")
     if not st.session_state.mostra_camera:
         if st.button("📷 SCANSIONA VIN", use_container_width=True):
-            st.session_state.mostra_camera = True
-            st.rerun()
+            st.session_state.mostra_camera = True; st.rerun()
     else:
         if st.button("❌ CHIUDI CAMERA"): st.session_state.mostra_camera = False; st.rerun()
         qr_img = st.camera_input("Inquadra il VIN")
@@ -164,9 +163,9 @@ if menu == "🔍 Ispezione":
                 st.session_state.vin_attuale = vin_rilevato.upper().strip()
                 st.session_state.mostra_camera = False; st.rerun()
 
-    vin_corrente = st.selectbox("Seleziona veicolo:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
+    vin_corrente = st.selectbox("Mezzo scelto:", LISTA_VIN, index=LISTA_VIN.index(st.session_state.vin_attuale))
     targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
-    st.warning(f"🚗 Ispezione per: {targa_corrente}")
+    st.warning(f"🚗 Ispezionando: {targa_corrente}")
 
     video = st.file_uploader("Carica Video", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
@@ -174,12 +173,10 @@ if menu == "🔍 Ispezione":
             with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame("temp.mp4")
-                
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
-                if storico.lower() == "nan": storico = ""
                 
-                prompt = f"Analisi danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Verifica se la targa nel video e' {targa_corrente}."
+                prompt = f"Analisi danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
                 
                 is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
@@ -189,11 +186,12 @@ if menu == "🔍 Ispezione":
                 df.at[idx, "Report"] = str(ris_ai)
                 df.at[idx, "Data"] = data_ora
                 df.at[idx, "Stato"] = stato_f
+                df.at[idx, "Operatore"] = st.session_state.user # SALVA CHI HA FATTO IL TEST
                 
                 if salva_dati(df):
-                    st.success("Analisi completata!")
+                    st.success("Analisi completata e salvata!")
                     st.markdown(ris_ai)
-                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora)
+                    pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora, st.session_state.user)
                     st.download_button("📥 SCARICA REPORT PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
         else: st.warning("Metti il video!")
 
@@ -204,16 +202,19 @@ elif menu == "📂 Archivio":
     if idx_list:
         r = df.iloc[idx_list[0]]
         st.subheader(f"Mezzo: {r['Targa']}")
-        st.write(f"Stato: {r['Stato']} | Data: {r['Data']}")
+        st.write(f"**Stato:** {r['Stato']}")
+        st.write(f"**Operatore:** {r['Operatore']}")
+        st.write(f"**Data:** {r['Data']}")
         if r['Report'] and str(r['Report']).strip() != "":
             st.markdown("---")
             st.markdown(r['Report'])
-            pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'])
+            pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'], r['Operatore'])
             st.download_button(label=f"📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
 
 elif menu == "👑 Admin":
     st.title("Admin")
     if st.text_input("Password", type="password") == "GSSA2026":
+        st.write("Tabella completa flotta (con operatore):")
         st.dataframe(df, use_container_width=True)
 
 if os.path.exists("temp.mp4"): os.remove("temp.mp4")
