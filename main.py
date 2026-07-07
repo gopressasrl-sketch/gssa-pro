@@ -67,7 +67,7 @@ def salva_dati(df_to_save):
 # --- FUNZIONI PDF ---
 def pulizia_per_pdf(testo):
     if not testo or testo == "nan": return "Nessun dettaglio."
-    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-").replace("·", "-")
+    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-")
     nfkd_form = unicodedata.normalize('NFKD', testo)
     testo_no_accenti = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
     testo_finale = testo_no_accenti.encode('ascii', 'ignore').decode('ascii')
@@ -88,7 +88,8 @@ def crea_pdf_bytes(targa, vin, testo, stato, data_report, operatore):
     pdf.cell(0, 10, f"STATO: {pulizia_per_pdf(stato)}", ln=True, align="C", fill=True)
     pdf.ln(5); pdf.set_font("Arial", "", 10)
     pdf.multi_cell(0, 7, pulizia_per_pdf(testo))
-    return bytes(pdf.output(dest='S'))
+    out = pdf.output(dest='S')
+    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode('latin-1')
 
 def genera_manuale_pdf():
     pdf = FPDF()
@@ -109,7 +110,8 @@ def genera_manuale_pdf():
     ]
     for riga in testo:
         pdf.cell(0, 8, riga, ln=True)
-    return bytes(pdf.output(dest='S'))
+    out = pdf.output(dest='S')
+    return bytes(out) if isinstance(out, (bytes, bytearray)) else out.encode('latin-1')
 
 # --- FUNZIONI AI E VIDEO ---
 def chiama_gemini(prompt, frames_b64):
@@ -176,7 +178,7 @@ if menu == "🔍 Ispezione":
     targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
     st.info(f"Ispezione per: **{targa_corrente}**")
 
-    video = st.file_uploader("Carica Video", type=["mp4", "mov"])
+    video = st.file_uploader("Carica Video Giro Mezzo", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
         if video:
             with st.spinner("Analisi in corso..."):
@@ -220,13 +222,6 @@ elif menu == "📖 Manuale":
     st.write("Scarica il manuale d'istruzioni completo per l'app.")
     manuale_pdf = genera_manuale_pdf()
     st.download_button("📥 SCARICA MANUALE PDF", data=manuale_pdf, file_name="Manuale_GSSA_PRO.pdf", mime="application/pdf")
-    st.markdown("""
-    ### Istruzioni Veloci:
-    1. **Loggati** col tuo nome.
-    2. **Scansiona il QR** sul furgone per non sbagliare targa.
-    3. **Fai il video** girando intorno al mezzo lentamente.
-    4. **Controlla l'esito** e scarica il PDF.
-    """)
 
 elif menu == "👑 Admin":
     st.title("👑 Admin")
