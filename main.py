@@ -67,7 +67,7 @@ def salva_dati(df_to_save):
 # --- FUNZIONI PDF ---
 def pulizia_per_pdf(testo):
     if not testo or testo == "nan": return "Nessun dettaglio."
-    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-")
+    testo = testo.replace("ë", "e").replace("Ë", "E").replace("’", "'").replace("•", "-").replace("·", "-")
     nfkd_form = unicodedata.normalize('NFKD', testo)
     testo_no_accenti = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
     testo_finale = testo_no_accenti.encode('ascii', 'ignore').decode('ascii')
@@ -90,12 +90,32 @@ def crea_pdf_bytes(targa, vin, testo, stato, data_report, operatore):
     pdf.multi_cell(0, 7, pulizia_per_pdf(testo))
     return bytes(pdf.output(dest='S'))
 
-# --- FUNZIONI AI E VIDEO (OTTIMIZZATE) ---
+def genera_manuale_pdf():
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 15, "MANUALE D'USO GSSA PRO", ln=True, align="C")
+    pdf.ln(5)
+    pdf.set_font("Arial", "", 11)
+    testo = [
+        "1. ACCESSO: Inserisci il tuo Nome e Cognome per iniziare.",
+        "2. IDENTIFICAZIONE: Clicca su 'SCANSIONA VIN' e inquadra il QR Code sul mezzo.",
+        "3. VIDEO: Carica o registra un video facendo un giro LENTO intorno al furgone.",
+        "4. ANALISI: Clicca su 'AVVIA ANALISI'. L'IA trovera' graffi e ammaccature.",
+        "5. PDF: Scarica il report ufficiale premendo il tasto blu 'SCARICA PDF'.",
+        "6. ARCHIVIO: Puoi rivedere le vecchie perizie nel menu 'Archivio'.",
+        "",
+        "CONSIGLI: Fai il video con molta luce e muoviti lentamente."
+    ]
+    for riga in testo:
+        pdf.cell(0, 8, riga, ln=True)
+    return bytes(pdf.output(dest='S'))
+
+# --- FUNZIONI AI E VIDEO ---
 def chiama_gemini(prompt, frames_b64):
     url = f"https://generativelanguage.googleapis.com/v1beta/{MODELLO_ATTIVO}:generateContent?key={API_KEY}"
     inline_data = [{"inline_data": {"mime_type": "image/jpeg", "data": f}} for f in frames_b64]
     payload = {"contents": [{"parts": [{"text": prompt}] + inline_data}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4000}}
-    # Aumentato timeout a 300 secondi per evitare ReadTimeout
     res = requests.post(url, headers={'Content-Type': 'application/json'}, data=json.dumps(payload), timeout=300)
     if res.status_code == 200:
         return res.json()['candidates'][0]['content']['parts'][0]['text']
@@ -105,13 +125,11 @@ def estrai_frame(video_path):
     frames = []
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    # Ridotto a 30 fotogrammi per velocità e stabilità
     num_frames = 30
     step = max(1, total // num_frames)
     for i in range(num_frames):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i * step); ret, frame = cap.read()
         if not ret: break
-        # Compressione al 50% per alleggerire il pacchetto dati
         _, buff = cv2.imencode('.jpg', cv2.resize(frame, (640, 480)), [cv2.IMWRITE_JPEG_QUALITY, 50])
         frames.append(base64.b64encode(buff).decode('utf-8'))
     cap.release()
@@ -121,10 +139,10 @@ def estrai_frame(video_path):
 st.set_page_config(page_title="GSSA PRO", layout="wide")
 
 if 'user' not in st.session_state:
-    st.title("🚚 Accesso Operatore")
+    st.title("🚚 Accesso Operatore GSSA")
     nome = st.text_input("Nome")
     cognome = st.text_input("Cognome")
-    if st.button("ACCEDI ALLA FLOTTA"):
+    if st.button("ACCEDI"):
         if nome and cognome:
             st.session_state.user = f"{nome.strip()} {cognome.strip()}".upper()
             st.rerun()
@@ -136,7 +154,7 @@ if 'mostra_camera' not in st.session_state: st.session_state.mostra_camera = Fal
 
 st.sidebar.title("Furgoni GSSA")
 st.sidebar.success(f"👤 {st.session_state.user}")
-menu = st.sidebar.radio("Vai a:", ["🔍 Ispezione", "📂 Archivio", "👑 Admin"])
+menu = st.sidebar.radio("Vai a:", ["🔍 Ispezione", "📂 Archivio", "📖 Manuale", "👑 Admin"])
 
 if menu == "🔍 Ispezione":
     st.title("Nuova Ispezione")
@@ -158,18 +176,16 @@ if menu == "🔍 Ispezione":
     targa_corrente = MAPPA_VIN_TARGA[vin_corrente]
     st.info(f"Ispezione per: **{targa_corrente}**")
 
-    video = st.file_uploader("Carica Video Giro Mezzo", type=["mp4", "mov"])
+    video = st.file_uploader("Carica Video", type=["mp4", "mov"])
     if st.button("🚀 AVVIA ANALISI"):
         if video:
-            with st.spinner("Analisi IA in corso (attendere circa 1 minuto)..."):
+            with st.spinner("Analisi in corso..."):
                 with open("temp.mp4", "wb") as f: f.write(video.read())
                 b64_imgs = estrai_frame("temp.mp4")
                 idx = df.index[df['VIN'] == vin_corrente].tolist()[0]
                 storico = str(df.at[idx, "Report"])
-                
-                prompt = f"Analisi danni furgone {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'. Nota se la targa e' diversa."
+                prompt = f"Analisi danni {targa_corrente}. Storico: {storico}. Elenca NUOVI danni o rispondi 'NESSUN NUOVO DANNO'."
                 ris_ai = chiama_gemini(prompt, b64_imgs)
-                
                 if "Errore" not in ris_ai:
                     is_nuovo = "NESSUN NUOVO DANNO" not in ris_ai.upper()
                     data_ora = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -178,15 +194,12 @@ if menu == "🔍 Ispezione":
                     df.at[idx, "Data"] = data_ora
                     df.at[idx, "Stato"] = stato_f
                     df.at[idx, "Operatore"] = st.session_state.user
-                    
                     if salva_dati(df):
                         st.success("Analisi completata!")
                         st.markdown(ris_ai)
                         pdf_b = crea_pdf_bytes(targa_corrente, vin_corrente, ris_ai, stato_f, data_ora, st.session_state.user)
                         st.download_button("📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{targa_corrente}.pdf", mime="application/pdf")
-                else:
-                    st.error(ris_ai)
-        else: st.warning("Carica il video!")
+        else: st.warning("Metti il video!")
 
 elif menu == "📂 Archivio":
     st.title("📂 Archivio")
@@ -201,6 +214,19 @@ elif menu == "📂 Archivio":
             st.markdown(r['Report'])
             pdf_b = crea_pdf_bytes(r['Targa'], r['VIN'], r['Report'], r['Stato'], r['Data'], r['Operatore'])
             st.download_button(label=f"📥 SCARICA PDF", data=pdf_b, file_name=f"Report_{r['Targa']}.pdf", mime="application/pdf")
+
+elif menu == "📖 Manuale":
+    st.title("📖 Manuale d'Uso")
+    st.write("Scarica il manuale d'istruzioni completo per l'app.")
+    manuale_pdf = genera_manuale_pdf()
+    st.download_button("📥 SCARICA MANUALE PDF", data=manuale_pdf, file_name="Manuale_GSSA_PRO.pdf", mime="application/pdf")
+    st.markdown("""
+    ### Istruzioni Veloci:
+    1. **Loggati** col tuo nome.
+    2. **Scansiona il QR** sul furgone per non sbagliare targa.
+    3. **Fai il video** girando intorno al mezzo lentamente.
+    4. **Controlla l'esito** e scarica il PDF.
+    """)
 
 elif menu == "👑 Admin":
     st.title("👑 Admin")
